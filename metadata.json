@@ -1,0 +1,6 @@
+{
+  "name": "INVENTORY MANAGEMENT TEAMS",
+  "description": "Unified Enterprise Inventory Intelligence for E-Commerce, Manufacturing, and Field Service Operations with Embedded Gemini Copilot.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
