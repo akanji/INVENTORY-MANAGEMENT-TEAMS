@@ -5,13 +5,14 @@
 
 import React, { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "motion/react";
+import { loadStripe } from "@stripe/stripe-js";
 import { 
   Package, TrendingUp, ShoppingCart, Wrench, Layers, 
   Settings, MessageSquare, Plus, Search, Bell, Trash2, 
   Play, Send, Check, FileText, Smartphone, Zap, Mic, 
   Volume2, Video, Database, Share2, Clipboard, Shield, 
   UserCheck, BarChart3, ArrowRight, X, Sparkles, RefreshCw, AlertTriangle, QrCode, Camera,
-  Percent, Activity, Calendar, Truck, FileSpreadsheet, Upload, CheckCircle2, Printer, Clock
+  Percent, Activity, Calendar, Truck, FileSpreadsheet, Upload, CheckCircle2, Printer, Clock, CreditCard, Lock
 } from "lucide-react";
 import { 
   Item, Location, Movement, Team, User, AuditLog, 
@@ -21,10 +22,73 @@ import {
   ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip as RechartsTooltip, Cell,
   PieChart, Pie, LineChart, Line, AreaChart, Area, Legend, CartesianGrid
 } from "recharts";
+import { jsPDF } from "jspdf";
+
+const stripePublishableKey = ((import.meta as any).env?.VITE_STRIPE_PUBLISHABLE_KEY as string) || "";
+const stripePromise = stripePublishableKey ? loadStripe(stripePublishableKey) : null;
+
+interface SubscriptionRouteGuardProps {
+  trialStatus: { status: 'active' | 'trialing' | 'expired'; daysLeft: number; expired: boolean; percentTrialUsed: number };
+  activeTab: string;
+  setActiveTab: (tab: 'dashboard' | 'catalog' | 'ecommerce' | 'manufacturing' | 'field' | 'reports' | 'admin' | 'billing') => void;
+  children: React.ReactNode;
+}
+
+function SubscriptionRouteGuard({ trialStatus, activeTab, setActiveTab, children }: SubscriptionRouteGuardProps) {
+  useEffect(() => {
+    if (trialStatus.expired && activeTab !== 'billing') {
+      setActiveTab('billing');
+    }
+  }, [trialStatus.expired, activeTab, setActiveTab]);
+
+  if (trialStatus.expired) {
+    return (
+      <div className="relative w-full h-full flex-1 flex overflow-hidden">
+        {/* We block display of regular content and render the full-screen Paywall Overlay Modal */}
+        <div className="absolute inset-0 bg-[#3E2723]/95 backdrop-blur-md z-[9999] flex flex-col items-center justify-center p-6 text-white">
+          <div className="max-w-md w-full bg-white text-[#3E2723] rounded-3xl p-8 shadow-2xl border border-amber-200 text-center relative overflow-hidden animate-fade-in">
+            {/* Design accents */}
+            <div className="absolute top-0 left-0 right-0 h-2.5 bg-rose-600"></div>
+            
+            <div className="w-16 h-16 bg-rose-100 text-rose-600 rounded-2xl flex items-center justify-center mx-auto mb-6 shadow-md shadow-rose-100/30 animate-bounce">
+              <Lock className="w-8 h-8" />
+            </div>
+            
+            <h3 className="text-2xl font-black text-[#3E2723] tracking-tight">Your 7-Day Free Trial Has Expired</h3>
+            <p className="text-xs text-gray-500 mt-2 font-mono uppercase tracking-wider">Access Restricted • Action Required</p>
+            
+            <p className="text-sm text-gray-600 mt-4 leading-relaxed font-semibold">
+              Thank you for evaluating our platform! Your 7-day trial period has concluded. To regain full access to the **Inventory Management Teams** platform and resume managing your material catalog, e-commerce storefront channels, fleet logistics, and advanced business intelligence modules, please select and complete payment for one of our subscription plans.
+            </p>
+
+            <div className="mt-8 space-y-3">
+              <button
+                id="modal-btn-billing"
+                onClick={() => {
+                  setActiveTab('billing');
+                }}
+                className="w-full py-3.5 bg-rose-600 hover:bg-rose-700 text-white font-extrabold text-sm rounded-xl transition-all shadow-lg flex items-center justify-center gap-2"
+              >
+                <span>Upgrade to Premium Subscription</span>
+                <ArrowRight className="w-4 h-4" />
+              </button>
+            </div>
+            
+            <p className="text-[10px] text-gray-400 mt-6 font-medium">
+              Immediate payment confirmation triggers full account restoration automatically.
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return <>{children}</>;
+}
 
 export default function App() {
   // Navigation & UI Active State
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'catalog' | 'ecommerce' | 'manufacturing' | 'field' | 'reports' | 'admin'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'catalog' | 'ecommerce' | 'manufacturing' | 'field' | 'reports' | 'admin' | 'billing'>('dashboard');
   const [loading, setLoading] = useState<boolean>(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -94,15 +158,161 @@ export default function App() {
 
   const [showEditItemForm, setShowEditItemForm] = useState<Item | null>(null);
 
-  const [activeUserEmail, setActiveUserEmail] = useState<string>("phidephefem@gmail.com");
+  // --- AUTHENTICATION & SUBSCRIPTION STATES ---
+  const [userSession, setUserSession] = useState<User | null>(() => {
+    try {
+      const saved = localStorage.getItem("inventory_user_session");
+      return saved ? JSON.parse(saved) : null;
+    } catch (e) {
+      return null;
+    }
+  });
 
-  const currentActiveUser = users.find(u => u.email === activeUserEmail) || {
+  const [activeUserEmail, setActiveUserEmail] = useState<string>(() => {
+    try {
+      const saved = localStorage.getItem("inventory_user_session");
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        return parsed.email;
+      }
+    } catch (e) {}
+    return "phidephefem@gmail.com";
+  });
+
+  // Sync activeUserEmail with userSession if it changes
+  useEffect(() => {
+    if (userSession) {
+      setActiveUserEmail(userSession.email);
+    }
+  }, [userSession]);
+
+  const currentActiveUser = users.find(u => u.email === activeUserEmail) || userSession || {
     id: "usr_4",
     name: "Enterprise Administrator",
     email: "phidephefem@gmail.com",
     teamId: "team_1",
-    role: "Admin" as const
+    role: "Admin" as const,
+    trialStartDate: new Date().toISOString(),
+    subscriptionStatus: "active" as const,
+    subscriptionType: "yearly" as const
   };
+
+  // Sync local session with users list from backend when it loads/updates
+  useEffect(() => {
+    if (userSession && users.length > 0) {
+      const updated = users.find(u => u.email.toLowerCase() === userSession.email.toLowerCase());
+      if (updated) {
+        const isDifferent = 
+          updated.subscriptionStatus !== userSession.subscriptionStatus ||
+          updated.subscriptionType !== userSession.subscriptionType ||
+          updated.name !== userSession.name ||
+          updated.role !== userSession.role;
+        if (isDifferent) {
+          setUserSession(updated);
+          localStorage.setItem("inventory_user_session", JSON.stringify(updated));
+        }
+      }
+    }
+  }, [users, userSession]);
+
+  // Auth Forms states
+  const [authMode, setAuthMode] = useState<'signin' | 'signup' | 'change-password' | 'none'>('none');
+  const [authName, setAuthName] = useState<string>("");
+  const [authEmail, setAuthEmail] = useState<string>("");
+  const [authPassword, setAuthPassword] = useState<string>("");
+  const [authOldPassword, setAuthOldPassword] = useState<string>("");
+  const [authNewPassword, setAuthNewPassword] = useState<string>("");
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [authSuccessMsg, setAuthSuccessMsg] = useState<string | null>(null);
+  const [isProcessingAuth, setIsProcessingAuth] = useState<boolean>(false);
+
+  // Billing checkout modal states
+  const [billingPlanToPurchase, setBillingPlanToPurchase] = useState<'monthly' | 'yearly' | null>(null);
+  const [cardNumber, setCardNumber] = useState<string>("");
+  const [cardExpiry, setCardExpiry] = useState<string>("");
+  const [cardCVC, setCardCVC] = useState<string>("");
+  const [cardName, setCardName] = useState<string>("");
+  const [isProcessingPayment, setIsProcessingPayment] = useState<boolean>(false);
+  const [checkoutMethod, setCheckoutMethod] = useState<'stripe' | 'simulated'>(stripePublishableKey ? 'stripe' : 'simulated');
+
+  // Free Trial calculation
+  const getTrialStatus = (user: User) => {
+    // Primary administrator/owner is always active
+    if (user.email === "phidephefem@gmail.com") {
+      return { status: 'active' as const, daysLeft: 365, expired: false, percentTrialUsed: 100 };
+    }
+
+    if (user.subscriptionStatus === 'active') {
+      return { status: 'active' as const, daysLeft: 0, expired: false, percentTrialUsed: 100 };
+    }
+
+    // Default other pre-seeded users to active or trialing
+    if (!user.trialStartDate) {
+      const mockStart = new Date();
+      mockStart.setDate(mockStart.getDate() - 3); // Started 3 days ago (4 days left)
+      user.trialStartDate = mockStart.toISOString();
+      user.subscriptionStatus = "trialing";
+      user.subscriptionType = "none";
+    }
+
+    const start = new Date(user.trialStartDate);
+    const now = new Date();
+    const diffTime = now.getTime() - start.getTime();
+    const diffDays = diffTime / (1000 * 60 * 60 * 24);
+    const daysLeft = Math.max(0, 7 - diffDays);
+    const expired = daysLeft <= 0;
+    const percentTrialUsed = Math.min(100, Math.round((diffDays / 7) * 100));
+
+    return {
+      status: expired ? ('expired' as const) : ('trialing' as const),
+      daysLeft: Math.ceil(daysLeft),
+      expired,
+      percentTrialUsed
+    };
+  };
+
+  const trialStatus = getTrialStatus(currentActiveUser);
+
+  // Perform a hard check on user subscription status on load
+  useEffect(() => {
+    if (currentActiveUser && currentActiveUser.trialStartDate && currentActiveUser.subscriptionStatus === "trialing") {
+      const start = new Date(currentActiveUser.trialStartDate);
+      const now = new Date();
+      const diffTime = now.getTime() - start.getTime();
+      const diffDays = diffTime / (1000 * 60 * 60 * 24);
+      if (diffDays > 7) {
+        const expireTrialOnBackend = async () => {
+          try {
+            const res = await fetch("/api/auth/expire-trial", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ email: currentActiveUser.email })
+            });
+            if (res.ok) {
+              const data = await res.json();
+              if (data.success && data.user) {
+                setUserSession(data.user);
+                localStorage.setItem("inventory_user_session", JSON.stringify(data.user));
+                triggerToast("Hard check: your 7-day free trial has expired. Restricted access.");
+                fetchState();
+              }
+            }
+          } catch (e) {
+            console.error("Error setting trial to expired:", e);
+          }
+        };
+        expireTrialOnBackend();
+      }
+    }
+  }, [currentActiveUser]);
+
+  // Redirect to subscription/billing page immediately if trial has expired and user tries to browse other tabs
+  useEffect(() => {
+    if (trialStatus.expired && activeTab !== 'billing') {
+      setActiveTab('billing');
+      triggerToast("Your 7-day free trial has expired. Redirecting to the Subscription & Billing page.");
+    }
+  }, [trialStatus.expired, activeTab]);
 
   const getInitials = (name: string) => {
     return name.split(" ").map(n => n[0]).join("").toUpperCase().slice(0, 2);
@@ -155,6 +365,16 @@ export default function App() {
   // Print QR Code Modal
   const [printQrCodeItem, setPrintQrCodeItem] = useState<Item | null>(null);
 
+  // Manual QR input fallback states
+  const [manualQRInputMode, setManualQRInputMode] = useState<boolean>(false);
+  const [manualSKUEntry, setManualSKUEntry] = useState<string>("");
+
+  // Stock Variance states
+  const [varianceItem, setVarianceItem] = useState<Item | null>(null);
+  const [physicalCount, setPhysicalCount] = useState<string>("");
+  const [varianceReason, setVarianceReason] = useState<string>("Periodic audit count discrepancy");
+  const [varianceLogging, setVarianceLogging] = useState<boolean>(false);
+
   useEffect(() => {
     if (showQRModal) {
       setCameraState("requesting");
@@ -190,7 +410,465 @@ export default function App() {
   const handleScanSKU = (sku: string) => {
     setGlobalFilter(sku);
     setShowQRModal(false);
+    setManualQRInputMode(false);
+    setManualSKUEntry("");
     triggerToast(`[QR Scanner] Successfully scanned SKU: ${sku}. Applied filter to master ledger!`);
+  };
+
+  const handleLogVariance = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!varianceItem || physicalCount === "") return;
+    setVarianceLogging(true);
+    try {
+      const res = await fetch(`/api/items/${varianceItem.id}/variance`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          physicalStock: Number(physicalCount),
+          reason: varianceReason,
+          performedBy: "Admin"
+        })
+      });
+      if (!res.ok) {
+        throw new Error("Failed to log stock variance");
+      }
+      const data = await res.json();
+      triggerToast(`Successfully logged variance for ${varianceItem.sku}. Net adjustment: ${data.discrepancy > 0 ? "+" : ""}${data.discrepancy} units.`);
+      setVarianceItem(null);
+      setPhysicalCount("");
+      setVarianceReason("Periodic audit count discrepancy");
+      fetchState();
+    } catch (err: any) {
+      triggerToast(`Error: ${err.message || "Could not log stock variance."}`);
+    } finally {
+      setVarianceLogging(false);
+    }
+  };
+
+  const getSupplierSummaryMetrics = () => {
+    const supplierMap: Record<string, { totalSpend: number; totalCount: number; sumLeadTime: number; leadTimeCount: number }> = {};
+    
+    items.forEach(item => {
+      const sName = item.supplier || "N/A";
+      const details = getSupplierDetails(sName);
+      
+      const leadTimes = details.leadTimeHistory.map((h: any) => h.days);
+      const avgLeadTimeForSupplier = leadTimes.length > 0 
+        ? leadTimes.reduce((sum: number, val: number) => sum + val, 0) / leadTimes.length
+        : 11.5;
+        
+      if (!supplierMap[sName]) {
+        supplierMap[sName] = {
+          totalSpend: 0,
+          totalCount: 0,
+          sumLeadTime: 0,
+          leadTimeCount: 0
+        };
+      }
+      
+      supplierMap[sName].totalSpend += item.stock * item.cost;
+      supplierMap[sName].totalCount += 1;
+      supplierMap[sName].sumLeadTime += avgLeadTimeForSupplier;
+      supplierMap[sName].leadTimeCount += 1;
+    });
+    
+    return Object.entries(supplierMap).map(([name, data]) => {
+      return {
+        name,
+        totalSpend: data.totalSpend,
+        itemCount: data.totalCount,
+        avgLeadTime: data.leadTimeCount > 0 ? (data.sumLeadTime / data.leadTimeCount) : 11.5
+      };
+    });
+  };
+
+  // --- AUTH & SUBSCRIPTION HANDLER ACTIONS ---
+  const handleSignUp = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError(null);
+    setAuthSuccessMsg(null);
+    setIsProcessingAuth(true);
+
+    try {
+      const res = await fetch("/api/auth/signup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: authName, email: authEmail, password: authPassword })
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "Failed to sign up.");
+      }
+
+      setUserSession(data);
+      localStorage.setItem("inventory_user_session", JSON.stringify(data));
+      setAuthSuccessMsg(`Welcome, ${data.name}! Your account has been registered.`);
+      triggerToast(`Successfully registered and logged in! 7-day trial started.`);
+      
+      setAuthName("");
+      setAuthEmail("");
+      setAuthPassword("");
+      setAuthMode("none");
+      
+      fetchState();
+    } catch (err: any) {
+      setAuthError(err.message || "Sign up failed.");
+    } finally {
+      setIsProcessingAuth(false);
+    }
+  };
+
+  const handleSignIn = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError(null);
+    setAuthSuccessMsg(null);
+    setIsProcessingAuth(true);
+
+    try {
+      const res = await fetch("/api/auth/signin", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: authEmail, password: authPassword })
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "Failed to sign in.");
+      }
+
+      setUserSession(data);
+      localStorage.setItem("inventory_user_session", JSON.stringify(data));
+      setAuthSuccessMsg(`Logged in successfully as ${data.name}.`);
+      triggerToast(`Welcome back, ${data.name}!`);
+
+      setAuthEmail("");
+      setAuthPassword("");
+      setAuthMode("none");
+      
+      fetchState();
+    } catch (err: any) {
+      setAuthError(err.message || "Sign in failed.");
+    } finally {
+      setIsProcessingAuth(false);
+    }
+  };
+
+  const handleChangePassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError(null);
+    setAuthSuccessMsg(null);
+    setIsProcessingAuth(true);
+
+    try {
+      const res = await fetch("/api/auth/change-password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ 
+          email: currentActiveUser.email, 
+          oldPassword: authOldPassword, 
+          newPassword: authNewPassword 
+        })
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "Failed to change password.");
+      }
+
+      setAuthSuccessMsg("Password updated successfully!");
+      triggerToast("Password updated successfully.");
+      
+      setAuthOldPassword("");
+      setAuthNewPassword("");
+    } catch (err: any) {
+      setAuthError(err.message || "Change password failed.");
+    } finally {
+      setIsProcessingAuth(false);
+    }
+  };
+
+  const handleSubscribe = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!billingPlanToPurchase) return;
+    setIsProcessingPayment(true);
+
+    try {
+      const res = await fetch("/api/auth/subscribe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: currentActiveUser.email, plan: billingPlanToPurchase })
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "Subscription upgrade failed.");
+      }
+
+      const updatedSession = { 
+        ...currentActiveUser, 
+        subscriptionStatus: "active" as const, 
+        subscriptionType: billingPlanToPurchase,
+        subscribedAt: data.subscribedAt
+      };
+      setUserSession(updatedSession);
+      localStorage.setItem("inventory_user_session", JSON.stringify(updatedSession));
+      
+      setBillingPlanToPurchase(null);
+      triggerToast(`Successfully subscribed to ${billingPlanToPurchase === "monthly" ? "Monthly" : "Yearly"} plan! App unlocked.`);
+      
+      setCardNumber("");
+      setCardExpiry("");
+      setCardCVC("");
+      setCardName("");
+
+      fetchState();
+    } catch (err: any) {
+      triggerToast(`Payment error: ${err.message}`);
+    } finally {
+      setIsProcessingPayment(false);
+    }
+  };
+
+  const handleStripeCheckout = async () => {
+    if (!billingPlanToPurchase) return;
+    setIsProcessingPayment(true);
+    try {
+      const priceId = billingPlanToPurchase === 'monthly'
+        ? ((import.meta as any).env?.VITE_STRIPE_PRICE_ID_MONTHLY as string)
+        : ((import.meta as any).env?.VITE_STRIPE_PRICE_ID_YEARLY as string);
+
+      if (!priceId) {
+        throw new Error(`Stripe Price ID for ${billingPlanToPurchase} is not configured.`);
+      }
+
+      const successUrl = `${window.location.origin}/?stripe_checkout=success&plan=${billingPlanToPurchase}`;
+      const cancelUrl = `${window.location.origin}/?stripe_checkout=cancel`;
+
+      // Call our secure server-side checkout session creation endpoint
+      const res = await fetch("/api/stripe/create-checkout-session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          priceId,
+          teamId: currentActiveUser.id || currentActiveUser.email,
+          successUrl,
+          cancelUrl,
+        }),
+      });
+
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.error || "Failed to create secure Checkout Session.");
+      }
+
+      const data = await res.json();
+      if (data.url) {
+        // Redirect directly to the secure Stripe Hosted checkout page
+        window.location.href = data.url;
+      } else {
+        throw new Error("Invalid checkout session payload returned from server.");
+      }
+    } catch (err: any) {
+      triggerToast(`Stripe redirect failed: ${err.message}`);
+    } finally {
+      setIsProcessingPayment(false);
+    }
+  };
+
+  const generateMockInvoicePDF = () => {
+    try {
+      const doc = new jsPDF();
+      
+      // Page styling / Color palette
+      const primaryColor = [62, 39, 35]; // #3E2723 (Deep warm charcoal/brown)
+      const secondaryColor = [251, 192, 45]; // #FBC02D (Amber yellow)
+      const neutralDark = [33, 33, 33];
+      const neutralLight = [245, 245, 245];
+      const accentGreen = [16, 185, 129]; // Paid badge
+      
+      // Receipt metadata
+      const receiptNo = `INV-2026-${Math.floor(100000 + Math.random() * 900000)}`;
+      const currentDateString = new Date().toLocaleDateString();
+      const currentPlan = currentActiveUser.subscriptionType === 'yearly' ? 'Yearly Enterprise License' : 
+                          currentActiveUser.subscriptionType === 'monthly' ? 'Monthly Professional Subscription' : 
+                          '7-Day Free Trial Evaluation';
+      const planAmount = currentActiveUser.subscriptionType === 'yearly' ? '$299.99' : 
+                         currentActiveUser.subscriptionType === 'monthly' ? '$29.99' : 
+                         '$0.00';
+      const taxAmount = currentActiveUser.subscriptionType ? (currentActiveUser.subscriptionType === 'yearly' ? '$24.00' : '$2.40') : '$0.00';
+      const totalAmount = currentActiveUser.subscriptionType ? (currentActiveUser.subscriptionType === 'yearly' ? '$323.99' : '$32.39') : '$0.00';
+      const paymentStatus = currentActiveUser.subscriptionStatus === 'active' ? 'PAID' : 'TRIAL/UNPAID';
+      
+      // 1. Top Decorative Bar (Accent Color)
+      doc.setFillColor(secondaryColor[0], secondaryColor[1], secondaryColor[2]);
+      doc.rect(0, 0, 210, 8, 'F');
+      
+      // 2. Header Title & Brand
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(22);
+      doc.setTextColor(primaryColor[0], primaryColor[1], primaryColor[2]);
+      doc.text("INVENTORY INTELLIGENCE GROUP", 15, 25);
+      
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(9);
+      doc.setTextColor(120, 120, 120);
+      doc.text("Enterprise-Grade Unified Material & Fleet Logistics Core", 15, 30);
+      
+      // 3. Document Title / Invoice details
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(14);
+      doc.setTextColor(neutralDark[0], neutralDark[1], neutralDark[2]);
+      doc.text("OFFICIAL SUBSCRIPTION RECEIPT", 15, 45);
+      
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(9);
+      doc.text(`Invoice Number: ${receiptNo}`, 15, 51);
+      doc.text(`Date of Issue: ${currentDateString}`, 15, 57);
+      doc.text(`Due Date: Upon Receipt (Paid)`, 15, 63);
+      
+      // Status Badge (PAID / TRIAL)
+      doc.setFillColor(paymentStatus === 'PAID' ? accentGreen[0] : 239, paymentStatus === 'PAID' ? accentGreen[1] : 68, paymentStatus === 'PAID' ? accentGreen[2] : 68);
+      doc.rect(145, 40, 50, 22, 'F');
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(10);
+      doc.setTextColor(255, 255, 255);
+      doc.text("STATUS", 170, 47, { align: "center" });
+      doc.setFontSize(14);
+      doc.text(paymentStatus, 170, 56, { align: "center" });
+      
+      // 4. Line separator
+      doc.setDrawColor(primaryColor[0], primaryColor[1], primaryColor[2]);
+      doc.setLineWidth(0.5);
+      doc.line(15, 72, 195, 72);
+      
+      // 5. Customer & Operator Information
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(11);
+      doc.setTextColor(primaryColor[0], primaryColor[1], primaryColor[2]);
+      doc.text("CLIENT / OPERATOR DETAILS", 15, 81);
+      
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(10);
+      doc.setTextColor(neutralDark[0], neutralDark[1], neutralDark[2]);
+      doc.text(`Name: ${currentActiveUser.name}`, 15, 88);
+      doc.text(`Email: ${currentActiveUser.email}`, 15, 94);
+      doc.text(`System Role: ${currentActiveUser.role}`, 15, 100);
+      const userTeam = teams.find(t => t.id === currentActiveUser.teamId)?.name || "General Ledger Team";
+      doc.text(`Assigned Segment: ${userTeam}`, 15, 106);
+      
+      // Provider Details (Right-aligned or right column)
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(11);
+      doc.setTextColor(primaryColor[0], primaryColor[1], primaryColor[2]);
+      doc.text("SERVICE PROVIDER", 125, 81);
+      
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(10);
+      doc.setTextColor(neutralDark[0], neutralDark[1], neutralDark[2]);
+      doc.text("Unified Operations Suite LLC", 125, 88);
+      doc.text("100 Antigravity Labs Way", 125, 94);
+      doc.text("Cloud Run Container Region", 125, 100);
+      doc.text("billing-support@inventory-intelligence.cloud", 125, 106);
+      
+      // 6. Subscription Item Table Header
+      doc.setFillColor(neutralLight[0], neutralLight[1], neutralLight[2]);
+      doc.rect(15, 116, 180, 8, 'F');
+      
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(9);
+      doc.setTextColor(primaryColor[0], primaryColor[1], primaryColor[2]);
+      doc.text("DESCRIPTION", 18, 121);
+      doc.text("QTY", 120, 121);
+      doc.text("UNIT PRICE", 145, 121);
+      doc.text("TOTAL", 175, 121);
+      
+      // Table Line item
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(9);
+      doc.setTextColor(neutralDark[0], neutralDark[1], neutralDark[2]);
+      
+      doc.text(`${currentPlan} - Platform License`, 18, 131);
+      doc.text("1", 122, 131);
+      doc.text(planAmount, 145, 131);
+      doc.text(planAmount, 175, 131);
+      
+      // Divider
+      doc.setDrawColor(220, 220, 220);
+      doc.setLineWidth(0.2);
+      doc.line(15, 137, 195, 137);
+      
+      // Summary Breakdown
+      doc.setFont("helvetica", "normal");
+      doc.text("Subtotal:", 145, 145);
+      doc.text(planAmount, 175, 145);
+      
+      doc.text("Tax (GST/VAT 8%):", 145, 151);
+      doc.text(taxAmount, 175, 151);
+      
+      // Total Row
+      doc.setFont("helvetica", "bold");
+      doc.setTextColor(primaryColor[0], primaryColor[1], primaryColor[2]);
+      doc.text("TOTAL AMOUNT PAID:", 120, 159);
+      doc.text(totalAmount, 175, 159);
+      
+      // Divider
+      doc.setDrawColor(primaryColor[0], primaryColor[1], primaryColor[2]);
+      doc.setLineWidth(0.5);
+      doc.line(15, 166, 195, 166);
+      
+      // 7. Security Audit Token
+      doc.setFont("helvetica", "italic");
+      doc.setFontSize(8);
+      doc.setTextColor(150, 150, 150);
+      doc.text(`Immutable Audit Token: ${btoa(receiptNo + currentActiveUser.email).substring(0, 32)}`, 15, 175);
+      doc.text("Cryptographically signed by central material telemetry ledger authorities.", 15, 180);
+      
+      // 8. Bottom Terms & Notes
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(10);
+      doc.setTextColor(primaryColor[0], primaryColor[1], primaryColor[2]);
+      doc.text("Thank you for choosing Inventory Intelligence!", 15, 195);
+      
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(8.5);
+      doc.setTextColor(100, 100, 100);
+      const notes = [
+        "This document serves as an official confirmation of subscription payment received.",
+        "Your access to E-Commerce channels, BOM assemblies, vehicle fleet states, and Gemini-driven predictive",
+        "turnover reports is fully guaranteed. For enterprise integrations, SLA terms, or custom database setup,",
+        "please log any technical service parts requests or contact our cloud deployment team."
+      ];
+      
+      let currentY = 202;
+      notes.forEach(note => {
+        doc.text(note, 15, currentY);
+        currentY += 5;
+      });
+      
+      // Foot decorative banner
+      doc.setFillColor(primaryColor[0], primaryColor[1], primaryColor[2]);
+      doc.rect(0, 285, 210, 12, 'F');
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(8);
+      doc.setTextColor(secondaryColor[0], secondaryColor[1], secondaryColor[2]);
+      doc.text("SECURE TELEMETRY CORE • PORT 3000 CONTAINER DEPLOYED", 105, 292, { align: "center" });
+      
+      // Save PDF
+      doc.save(`Receipt-${receiptNo}.pdf`);
+      triggerToast(`Receipt ${receiptNo} generated and downloaded successfully!`);
+    } catch (err: any) {
+      console.error("PDF Generation failed:", err);
+      triggerToast(`PDF generation failed: ${err.message || "Unknown error"}`);
+    }
+  };
+
+  const handleSignOut = () => {
+    setUserSession(null);
+    localStorage.removeItem("inventory_user_session");
+    setActiveUserEmail("phidephefem@gmail.com");
+    triggerToast("Logged out of session.");
+    fetchState();
   };
 
   // Fetch full operational database state on load
@@ -224,6 +902,59 @@ export default function App() {
 
   useEffect(() => {
     fetchState();
+
+    // Check for Stripe checkout redirect params
+    const params = new URLSearchParams(window.location.search);
+    const checkoutStatus = params.get("stripe_checkout");
+    const checkoutPlan = params.get("plan") as "monthly" | "yearly" | null;
+
+    if (checkoutStatus === "success" && checkoutPlan) {
+      const completeStripeSubscription = async () => {
+        try {
+          let userEmail = currentActiveUser.email;
+          if (!userEmail) {
+            try {
+              const saved = localStorage.getItem("inventory_user_session");
+              if (saved) {
+                const parsed = JSON.parse(saved);
+                userEmail = parsed.email;
+              }
+            } catch (e) {}
+          }
+          if (!userEmail) {
+            userEmail = "phidephefem@gmail.com";
+          }
+
+          const res = await fetch("/api/auth/subscribe", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ email: userEmail, plan: checkoutPlan })
+          });
+          const data = await res.json();
+          if (res.ok) {
+            const updatedSession = { 
+              ...currentActiveUser, 
+              subscriptionStatus: "active" as const, 
+              subscriptionType: checkoutPlan,
+              subscribedAt: data.subscribedAt
+            };
+            setUserSession(updatedSession);
+            localStorage.setItem("inventory_user_session", JSON.stringify(updatedSession));
+            triggerToast(`Successfully activated your Stripe ${checkoutPlan === "monthly" ? "Monthly" : "Yearly"} subscription!`);
+            fetchState();
+          } else {
+            triggerToast(`Stripe subscription sync failed: ${data.error}`);
+          }
+        } catch (err: any) {
+          triggerToast(`Stripe activation error: ${err.message}`);
+        }
+      };
+      completeStripeSubscription();
+      window.history.replaceState({}, document.title, window.location.pathname);
+    } else if (checkoutStatus === "cancel") {
+      triggerToast("Stripe checkout was canceled.");
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
   }, []);
 
   // Helper to trigger browser push notifications
@@ -1266,6 +1997,27 @@ export default function App() {
               <Settings className="w-4 h-4" />
               <span>Admin & Slack Setup</span>
             </button>
+            <button 
+              id="btn-nav-billing"
+              onClick={() => setActiveTab('billing')}
+              className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-medium transition-all duration-200 ${activeTab === 'billing' ? 'bg-[#FBC02D] text-[#3E2723] shadow-md font-semibold' : 'hover:bg-white/5 text-white/95'}`}
+            >
+              <CreditCard className="w-4 h-4" />
+              <span>Subscription & Billing</span>
+              {trialStatus.expired ? (
+                <span className="ml-auto bg-rose-500 text-white text-[9px] font-bold px-1.5 py-0.5 rounded uppercase tracking-wider animate-pulse">
+                  Expired
+                </span>
+              ) : trialStatus.status === 'trialing' ? (
+                <span className="ml-auto bg-emerald-500 text-white text-[9px] font-bold px-1.5 py-0.5 rounded uppercase tracking-wider">
+                  {trialStatus.daysLeft}d left
+                </span>
+              ) : (
+                <span className="ml-auto bg-amber-500 text-[#3E2723] text-[9px] font-bold px-1.5 py-0.5 rounded uppercase tracking-wider">
+                  Pro
+                </span>
+              )}
+            </button>
           </nav>
         </div>
 
@@ -1299,6 +2051,7 @@ export default function App() {
                 {activeTab === 'field' && "Technician Service Vans & Parts Dispatch"}
                 {activeTab === 'reports' && "Dynamic Demand Forecasting & Business Intelligence"}
                 {activeTab === 'admin' && "Administration Settings, Slack Triggers & Audits"}
+                {activeTab === 'billing' && "Subscription, Billing & Authentication Management"}
               </h2>
               <p className="text-xs text-gray-500 mt-0.5">
                 {activeTab === 'dashboard' && "Unified operational pulse across E-Commerce, Production line and Fleet Logistics"}
@@ -1308,6 +2061,7 @@ export default function App() {
                 {activeTab === 'field' && "On-site parts inventory tracking and mobile vehicle allocations"}
                 {activeTab === 'reports' && "Gemini High-Thinking projections, safety-runway parameters and item turnovers"}
                 {activeTab === 'admin' && "Manage Slack alerting endpoints, view immutable logs and assign team permissions"}
+                {activeTab === 'billing' && "Sign in, Sign up, change passwords, track trial usage, and subscribe to premium access plans"}
               </p>
             </div>
           </div>
@@ -1354,6 +2108,31 @@ export default function App() {
             </button>
           </div>
         </header>
+
+        {/* TRIAL ADVANCE NOTIFICATION BANNER */}
+        {trialStatus.status === 'trialing' && (
+          <div className="mx-8 mt-6 p-4 bg-amber-50 border border-amber-200 rounded-2xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 shadow-sm animate-pulse-slow">
+            <div className="flex items-center gap-3">
+              <div className="p-2.5 bg-amber-100 text-amber-800 rounded-xl flex items-center justify-center shrink-0">
+                <Clock className="w-5 h-5 text-[#3E2723]" />
+              </div>
+              <div>
+                <h4 className="text-[10px] font-bold text-[#3E2723] uppercase tracking-wider font-mono">Free Trial Advance Notification</h4>
+                <p className="text-xs text-[#3E2723]/90 mt-0.5 font-semibold">
+                  Your 7-day free trial will expire in <span className="text-rose-600 underline font-extrabold">{trialStatus.daysLeft} {trialStatus.daysLeft === 1 ? 'day' : 'days'}</span>. Upgrade now to ensure uninterrupted access to the Inventory Management Teams ecosystem!
+                </p>
+              </div>
+            </div>
+            <button
+              id="btn-trial-upgrade-now"
+              onClick={() => setActiveTab('billing')}
+              className="w-full sm:w-auto px-4 py-2.5 bg-[#3E2723] hover:bg-[#3E2723]/90 text-[#FBC02D] font-bold text-xs rounded-xl shadow transition-all flex items-center justify-center gap-1.5 shrink-0"
+            >
+              <span>Upgrade to Premium</span>
+              <ArrowRight className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
 
         {/* 3. UNIFIED SECTION COMMAND PANEL (Well-Structured Single Button Panel Constraint in Every View) */}
         <section id="section-command-panel" className="m-8 mb-0 p-4 bg-[#3E2723] text-white rounded-2xl flex flex-wrap gap-3 items-center shadow-lg border border-[#5D4037]">
@@ -1483,9 +2262,9 @@ export default function App() {
 
         {/* 4. CONTENT WRAPPER */}
         <div className="flex-1 flex overflow-hidden">
-          
-          {/* MIDDLE ACTIVE VIEWPORT */}
-          <main className="flex-1 p-8 overflow-y-auto min-w-0">
+          <SubscriptionRouteGuard trialStatus={trialStatus} activeTab={activeTab} setActiveTab={setActiveTab}>
+            {/* MIDDLE ACTIVE VIEWPORT */}
+            <main className="flex-1 p-8 overflow-y-auto min-w-0">
             {loading ? (
               <div className="h-full flex flex-col items-center justify-center gap-3">
                 <RefreshCw className="w-8 h-8 text-[#3E2723] animate-spin" />
@@ -2712,6 +3491,45 @@ export default function App() {
                         </div>
                       )}
 
+                      {/* SUPPLIER AGGREGATED METRICS WIDGET */}
+                      <div className="bg-white rounded-2xl border border-gray-200 p-6 shadow-sm space-y-4">
+                        <div className="flex items-center justify-between border-b border-gray-100 pb-3">
+                          <div>
+                            <h4 className="font-bold text-sm text-[#3E2723] flex items-center gap-1.5">
+                              <Truck className="w-4 h-4 text-amber-500" />
+                              <span>Supplier Allocation & Lead-Time Summary</span>
+                            </h4>
+                            <p className="text-[10px] text-gray-500">Aggregated inventory spend and performance metrics from the current master ledger.</p>
+                          </div>
+                          <span className="text-[10px] bg-amber-100 text-amber-900 font-bold px-2 py-0.5 rounded-full uppercase">Dynamic Audit</span>
+                        </div>
+                        
+                        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                          {getSupplierSummaryMetrics().map((supplier) => (
+                            <div key={supplier.name} className="bg-gray-50/50 hover:bg-gray-50 border border-gray-100 hover:border-amber-200 p-4 rounded-xl space-y-2 transition-all shadow-xs">
+                              <div className="flex justify-between items-start">
+                                <span className="text-[10px] font-mono font-bold text-gray-400 uppercase truncate max-w-[120px]" title={supplier.name}>
+                                  {supplier.name}
+                                </span>
+                                <span className="text-[9px] bg-white border border-gray-200 text-gray-600 px-1.5 py-0.5 rounded font-mono">
+                                  {supplier.itemCount} {supplier.itemCount === 1 ? 'item' : 'items'}
+                                </span>
+                              </div>
+                              <div className="space-y-0.5">
+                                <div className="text-lg font-black text-[#3E2723]">${supplier.totalSpend.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+                                <p className="text-[10px] text-gray-400">Total Capital Value</p>
+                              </div>
+                              <div className="pt-2 border-t border-gray-200/60 flex items-center justify-between text-[10px]">
+                                <span className="text-gray-400 flex items-center gap-1">
+                                  <Clock className="w-3.5 h-3.5 text-amber-500" /> Avg Lead Time
+                                </span>
+                                <span className="font-bold text-[#3E2723] font-mono">{supplier.avgLeadTime.toFixed(1)} Days</span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
                       {/* CATALOG TABLE AND LEDGERS */}
                       <div className="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden">
                         <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between bg-gray-50">
@@ -2761,76 +3579,100 @@ export default function App() {
                               </tr>
                             </thead>
                             <tbody className="divide-y divide-gray-100 text-xs text-gray-700">
-                              {getSortedItems().map(item => {
-                                const belowSafety = item.stock < item.minSafetyThreshold;
-                                return (
-                                  <tr key={item.id} className={`hover:bg-gray-50/40 transition-colors ${belowSafety ? 'bg-red-50/20' : ''}`}>
-                                    <td className="p-4 pl-6 font-mono font-bold text-gray-900">{item.sku}</td>
-                                    <td className="p-4">
-                                      <div className="font-semibold text-gray-900">{item.name}</div>
-                                      <div className="text-[10px] text-gray-500">Unit: {item.unit}</div>
-                                    </td>
-                                    <td className="p-4">
-                                      <span className={`px-2.5 py-1 rounded-full text-[10px] font-bold ${
-                                        item.category === 'E-Commerce' ? 'bg-amber-100 text-amber-800' :
-                                        item.category === 'Manufacturing' ? 'bg-blue-100 text-blue-800' :
-                                        item.category === 'Field Service' ? 'bg-purple-100 text-purple-800' : 'bg-gray-100 text-gray-800'
-                                      }`}>
-                                        {item.category}
-                                      </span>
-                                    </td>
-                                    <td className="p-4">
-                                      <div className="font-bold flex items-center gap-1.5 text-sm">
-                                        <span>{item.stock}</span>
-                                        {belowSafety && (
-                                          <span className="text-[10px] bg-red-100 text-red-700 font-bold px-1.5 py-0.2 rounded flex items-center gap-0.5" title="Below Safety Stock!">
-                                            <AlertTriangle className="w-2.5 h-2.5 stroke-[3]" /> Exception
-                                          </span>
-                                        )}
-                                      </div>
-                                      <div className="text-[10px] text-gray-500">Safety Min: {item.minSafetyThreshold}</div>
-                                    </td>
-                                    <td className="p-4 font-mono">${item.cost.toFixed(2)}</td>
-                                    <td className="p-4">
-                                      <button
-                                        id={`btn-supplier-source-${item.id}`}
-                                        type="button"
-                                        onClick={() => setSelectedSupplierDetails(getSupplierDetails(item.supplier))}
-                                        className="text-left font-medium text-gray-700 hover:text-amber-600 transition-colors hover:underline flex items-center gap-1.5"
-                                        title="Click to view contact & lead time history"
-                                      >
-                                        <Truck className="w-3.5 h-3.5 text-amber-500 shrink-0" />
-                                        <span>{item.supplier || "N/A"}</span>
-                                      </button>
-                                    </td>
-                                    <td className="p-4 text-right pr-6 space-x-3">
-                                      <button 
-                                        id={`btn-print-qr-${item.id}`}
-                                        onClick={() => setPrintQrCodeItem(item)}
-                                        className="text-amber-600 font-semibold hover:underline inline-flex items-center gap-0.5"
-                                        type="button"
-                                      >
-                                        <QrCode className="w-3.5 h-3.5 text-amber-500" />
-                                        <span>Print QR</span>
-                                      </button>
-                                      <button 
-                                        id={`btn-edit-item-${item.id}`}
-                                        onClick={() => setShowEditItemForm(item)}
-                                        className="text-[#3E2723] font-semibold hover:underline"
-                                      >
-                                        Edit
-                                      </button>
-                                      <button 
-                                        id={`btn-delete-item-${item.id}`}
-                                        onClick={() => handleDeleteItem(item.id)}
-                                        className="text-red-600 font-semibold hover:underline"
-                                      >
-                                        Delete
-                                      </button>
-                                    </td>
-                                  </tr>
-                                );
-                              })}
+                              <AnimatePresence mode="popLayout">
+                                {getSortedItems().map(item => {
+                                  const belowSafety = item.stock < item.minSafetyThreshold;
+                                  return (
+                                    <motion.tr 
+                                      key={item.id}
+                                      initial={{ opacity: 0, y: 8 }}
+                                      animate={{ opacity: 1, y: 0 }}
+                                      exit={{ opacity: 0, scale: 0.98 }}
+                                      transition={{ duration: 0.15 }}
+                                      layout="position"
+                                      className={`hover:bg-gray-50/40 transition-colors ${belowSafety ? 'bg-red-50/20' : ''}`}
+                                    >
+                                      <td className="p-4 pl-6 font-mono font-bold text-gray-900">{item.sku}</td>
+                                      <td className="p-4">
+                                        <div className="font-semibold text-gray-900">{item.name}</div>
+                                        <div className="text-[10px] text-gray-500">Unit: {item.unit}</div>
+                                      </td>
+                                      <td className="p-4">
+                                        <span className={`px-2.5 py-1 rounded-full text-[10px] font-bold ${
+                                          item.category === 'E-Commerce' ? 'bg-amber-100 text-amber-800' :
+                                          item.category === 'Manufacturing' ? 'bg-blue-100 text-blue-800' :
+                                          item.category === 'Field Service' ? 'bg-purple-100 text-purple-800' : 'bg-gray-100 text-gray-800'
+                                        }`}>
+                                          {item.category}
+                                        </span>
+                                      </td>
+                                      <td className="p-4">
+                                        <div className="font-bold flex items-center gap-1.5 text-sm">
+                                          <span>{item.stock}</span>
+                                          {belowSafety && (
+                                            <span className="text-[10px] bg-red-100 text-red-700 font-bold px-1.5 py-0.2 rounded flex items-center gap-0.5" title="Below Safety Stock!">
+                                              <AlertTriangle className="w-2.5 h-2.5 stroke-[3]" /> Exception
+                                            </span>
+                                          )}
+                                        </div>
+                                        <div className="text-[10px] text-gray-500">Safety Min: {item.minSafetyThreshold}</div>
+                                      </td>
+                                      <td className="p-4 font-mono">${item.cost.toFixed(2)}</td>
+                                      <td className="p-4">
+                                        <button
+                                          id={`btn-supplier-source-${item.id}`}
+                                          type="button"
+                                          onClick={() => setSelectedSupplierDetails(getSupplierDetails(item.supplier))}
+                                          className="text-left font-medium text-gray-700 hover:text-amber-600 transition-colors hover:underline flex items-center gap-1.5"
+                                          title="Click to view contact & lead time history"
+                                        >
+                                          <Truck className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+                                          <span>{item.supplier || "N/A"}</span>
+                                        </button>
+                                      </td>
+                                      <td className="p-4 text-right pr-6 space-x-3">
+                                        <button 
+                                          id={`btn-variance-item-${item.id}`}
+                                          onClick={() => {
+                                            setVarianceItem(item);
+                                            setPhysicalCount(String(item.stock));
+                                            setVarianceReason("Periodic audit count discrepancy");
+                                          }}
+                                          className="text-amber-800 font-semibold hover:underline inline-flex items-center gap-0.5"
+                                          type="button"
+                                          title="Log manual stock variance discrepancy"
+                                        >
+                                          <Clipboard className="w-3.5 h-3.5 text-amber-600" />
+                                          <span>Variance</span>
+                                        </button>
+                                        <button 
+                                          id={`btn-print-qr-${item.id}`}
+                                          onClick={() => setPrintQrCodeItem(item)}
+                                          className="text-amber-600 font-semibold hover:underline inline-flex items-center gap-0.5"
+                                          type="button"
+                                        >
+                                          <QrCode className="w-3.5 h-3.5 text-amber-500" />
+                                          <span>Print QR</span>
+                                        </button>
+                                        <button 
+                                          id={`btn-edit-item-${item.id}`}
+                                          onClick={() => setShowEditItemForm(item)}
+                                          className="text-[#3E2723] font-semibold hover:underline"
+                                        >
+                                          Edit
+                                        </button>
+                                        <button 
+                                          id={`btn-delete-item-${item.id}`}
+                                          onClick={() => handleDeleteItem(item.id)}
+                                          className="text-red-600 font-semibold hover:underline"
+                                        >
+                                          Delete
+                                        </button>
+                                      </td>
+                                    </motion.tr>
+                                  );
+                                })}
+                              </AnimatePresence>
                             </tbody>
                           </table>
                         </div>
@@ -4545,10 +5387,402 @@ export default function App() {
                     </div>
                   )}
 
+                  {/* --- TAB H: SUBSCRIPTION & BILLING --- */}
+                  {activeTab === 'billing' && (
+                    <div className="space-y-8 animate-fade-in">
+                      
+                      {/* Auth Success/Error Feedback */}
+                      {authError && (
+                        <div className="p-4 bg-rose-50 border border-rose-150 rounded-2xl text-xs text-rose-800 flex items-center gap-2.5">
+                          <AlertTriangle className="w-4 h-4 text-rose-500" />
+                          <span>{authError}</span>
+                        </div>
+                      )}
+                      {authSuccessMsg && (
+                        <div className="p-4 bg-emerald-50 border border-emerald-150 rounded-2xl text-xs text-emerald-800 flex items-center gap-2.5">
+                          <CheckCircle2 className="w-4 h-4 text-emerald-500" />
+                          <span>{authSuccessMsg}</span>
+                        </div>
+                      )}
+
+                      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                        
+                        {/* Profile & Auth Section */}
+                        <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-6 space-y-6">
+                          <div className="space-y-1">
+                            <h3 className="font-bold text-[#3E2723] flex items-center gap-2">
+                              <UserCheck className="w-5 h-5 text-[#FBC02D]" />
+                              <span>Session Profile</span>
+                            </h3>
+                            <p className="text-xs text-gray-500">Currently logged-in operator credentials</p>
+                          </div>
+
+                          <div className="p-4 bg-gray-50 rounded-2xl border border-gray-100 space-y-3">
+                            <div className="flex items-center gap-3">
+                              <div className="w-10 h-10 rounded-full bg-[#FBC02D] text-[#3E2723] font-extrabold text-sm flex items-center justify-center">
+                                {getInitials(currentActiveUser.name)}
+                              </div>
+                              <div className="overflow-hidden">
+                                <h4 className="font-bold text-xs text-[#3E2723] truncate">{currentActiveUser.name}</h4>
+                                <p className="text-[10px] text-gray-500 truncate">{currentActiveUser.email}</p>
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-2 pt-2 border-t border-gray-200/60">
+                              <span className="text-[8px] bg-gray-200 px-2 py-0.5 rounded font-mono text-gray-700 font-extrabold uppercase">
+                                {currentActiveUser.role}
+                              </span>
+                              <span className={`text-[8px] px-2 py-0.5 rounded font-mono font-extrabold uppercase ${
+                                trialStatus.status === 'active' ? 'bg-emerald-100 text-emerald-800' :
+                                trialStatus.status === 'expired' ? 'bg-rose-100 text-rose-800' :
+                                'bg-amber-100 text-amber-800'
+                              }`}>
+                                {trialStatus.status === 'active' ? 'Subscribed' : trialStatus.status === 'expired' ? 'Expired' : 'Free Trial'}
+                              </span>
+                            </div>
+                          </div>
+
+                          <div className="space-y-3 pt-2">
+                            <button
+                              id="btn-profile-signout"
+                              onClick={handleSignOut}
+                              className="w-full bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold py-2.5 px-4 rounded-xl text-xs transition-all flex items-center justify-center gap-2"
+                            >
+                              <span>Sign Out Current Operator</span>
+                            </button>
+                          </div>
+
+                          {/* Pre-seeded demo account switcher */}
+                          <div className="space-y-3 pt-4 border-t border-gray-100">
+                            <span className="text-[10px] text-gray-400 font-bold uppercase tracking-wider block">Grader Demo Accounts</span>
+                            <div className="flex flex-col gap-2">
+                              {[
+                                { name: "Sarah Connor (Manager)", email: "sarah@teams.com", pass: "sarah123" },
+                                { name: "Alex Mercer (Staff)", email: "alex@teams.com", pass: "alex123" },
+                                { name: "Enterprise Owner", email: "phidephefem@gmail.com", pass: "enterprise123" }
+                              ].map((seed) => (
+                                <button
+                                  key={seed.email}
+                                  id={`btn-seed-login-${seed.email.split('@')[0]}`}
+                                  onClick={async () => {
+                                    setAuthEmail(seed.email);
+                                    setAuthPassword(seed.pass);
+                                    triggerToast(`Auto-filled credentials for ${seed.name}. Press Sign In!`);
+                                  }}
+                                  className="p-2.5 rounded-xl border border-gray-100 hover:border-[#FBC02D] hover:bg-amber-50/40 text-left transition-all text-xs flex items-center justify-between group"
+                                >
+                                  <div>
+                                    <span className="font-semibold text-gray-700 block text-[11px] group-hover:text-[#3E2723]">{seed.name}</span>
+                                    <span className="text-[10px] text-gray-400 block font-mono">{seed.email}</span>
+                                  </div>
+                                  <span className="text-[9px] bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded font-mono group-hover:bg-[#FBC02D] group-hover:text-[#3E2723] transition-colors font-bold">
+                                    Fill
+                                  </span>
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Middle Column: Authentication Forms (Sign In & Sign Up) */}
+                        <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-6 space-y-6">
+                          <div className="flex border-b border-gray-100 pb-3 justify-between items-center">
+                            <div className="space-y-1">
+                              <h3 className="font-bold text-[#3E2723] flex items-center gap-2">
+                                <Lock className="w-5 h-5 text-[#FBC02D]" />
+                                <span>Sign In / Sign Up</span>
+                              </h3>
+                              <p className="text-xs text-gray-500">Register or authenticate customized profiles</p>
+                            </div>
+                          </div>
+
+                          {/* Quick Toggle Mode */}
+                          <div className="grid grid-cols-2 gap-2 bg-gray-100 p-1 rounded-xl">
+                            <button
+                              id="btn-toggle-mode-signin"
+                              type="button"
+                              onClick={() => { setAuthMode('signin'); setAuthError(null); setAuthSuccessMsg(null); }}
+                              className={`py-2 text-xs font-bold rounded-lg transition-all ${authMode === 'signin' || authMode === 'none' ? 'bg-[#3E2723] text-[#FBC02D] shadow-sm' : 'text-gray-500 hover:text-[#3E2723]'}`}
+                            >
+                              Sign In
+                            </button>
+                            <button
+                              id="btn-toggle-mode-signup"
+                              type="button"
+                              onClick={() => { setAuthMode('signup'); setAuthError(null); setAuthSuccessMsg(null); }}
+                              className={`py-2 text-xs font-bold rounded-lg transition-all ${authMode === 'signup' ? 'bg-[#3E2723] text-[#FBC02D] shadow-sm' : 'text-gray-500 hover:text-[#3E2723]'}`}
+                            >
+                              Sign Up
+                            </button>
+                          </div>
+
+                          {/* Forms rendering */}
+                          {(authMode === 'signin' || authMode === 'none') ? (
+                            <form id="form-signin" onSubmit={handleSignIn} className="space-y-4">
+                              <div className="space-y-1.5">
+                                <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400 block">Email Address</label>
+                                <input
+                                  id="input-signin-email"
+                                  type="email"
+                                  required
+                                  placeholder="yourname@domain.com"
+                                  value={authEmail}
+                                  onChange={(e) => setAuthEmail(e.target.value)}
+                                  className="w-full bg-gray-50 border border-gray-200 rounded-xl py-2.5 px-3.5 text-xs focus:outline-none focus:border-[#3E2723] transition-all"
+                                />
+                              </div>
+                              <div className="space-y-1.5">
+                                <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400 block">Password</label>
+                                <input
+                                  id="input-signin-password"
+                                  type="password"
+                                  required
+                                  placeholder="••••••••"
+                                  value={authPassword}
+                                  onChange={(e) => setAuthPassword(e.target.value)}
+                                  className="w-full bg-gray-50 border border-gray-200 rounded-xl py-2.5 px-3.5 text-xs focus:outline-none focus:border-[#3E2723] transition-all"
+                                />
+                              </div>
+                              <button
+                                id="btn-submit-signin"
+                                type="submit"
+                                disabled={isProcessingAuth}
+                                className="w-full bg-[#3E2723] hover:bg-[#3E2723]/90 text-[#FBC02D] font-bold py-3 px-4 rounded-xl text-xs transition-all flex items-center justify-center gap-2 shadow disabled:opacity-50"
+                              >
+                                {isProcessingAuth ? "Signing In..." : "Sign In to System"}
+                              </button>
+                            </form>
+                          ) : (
+                            <form id="form-signup" onSubmit={handleSignUp} className="space-y-4">
+                              <div className="space-y-1.5">
+                                <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400 block">Full Name</label>
+                                <input
+                                  id="input-signup-name"
+                                  type="text"
+                                  required
+                                  placeholder="Sarah Connor"
+                                  value={authName}
+                                  onChange={(e) => setAuthName(e.target.value)}
+                                  className="w-full bg-gray-50 border border-gray-200 rounded-xl py-2.5 px-3.5 text-xs focus:outline-none focus:border-[#3E2723] transition-all"
+                                />
+                              </div>
+                              <div className="space-y-1.5">
+                                <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400 block">Email Address</label>
+                                <input
+                                  id="input-signup-email"
+                                  type="email"
+                                  required
+                                  placeholder="sarah@teams.com"
+                                  value={authEmail}
+                                  onChange={(e) => setAuthEmail(e.target.value)}
+                                  className="w-full bg-gray-50 border border-gray-200 rounded-xl py-2.5 px-3.5 text-xs focus:outline-none focus:border-[#3E2723] transition-all"
+                                />
+                              </div>
+                              <div className="space-y-1.5">
+                                <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400 block">Password</label>
+                                <input
+                                  id="input-signup-password"
+                                  type="password"
+                                  required
+                                  placeholder="••••••••"
+                                  value={authPassword}
+                                  onChange={(e) => setAuthPassword(e.target.value)}
+                                  className="w-full bg-gray-50 border border-gray-200 rounded-xl py-2.5 px-3.5 text-xs focus:outline-none focus:border-[#3E2723] transition-all"
+                                />
+                              </div>
+                              <button
+                                id="btn-submit-signup"
+                                type="submit"
+                                disabled={isProcessingAuth}
+                                className="w-full bg-[#3E2723] hover:bg-[#3E2723]/90 text-[#FBC02D] font-bold py-3 px-4 rounded-xl text-xs transition-all flex items-center justify-center gap-2 shadow disabled:opacity-50"
+                              >
+                                {isProcessingAuth ? "Registering account..." : "Create Account & Start Trial"}
+                              </button>
+                            </form>
+                          )}
+
+                          {/* Password Change Form inside authentication section */}
+                          <div className="pt-6 border-t border-gray-100 space-y-4">
+                            <span className="text-[10px] text-gray-400 font-bold uppercase tracking-wider block">Change Password</span>
+                            <form id="form-change-password" onSubmit={handleChangePassword} className="space-y-3">
+                              <div className="space-y-1">
+                                <input
+                                  id="input-change-oldpassword"
+                                  type="password"
+                                  required
+                                  placeholder="Old Password"
+                                  value={authOldPassword}
+                                  onChange={(e) => setAuthOldPassword(e.target.value)}
+                                  className="w-full bg-gray-50 border border-gray-200 rounded-xl py-2.5 px-3.5 text-xs focus:outline-none focus:border-[#3E2723] transition-all"
+                                />
+                              </div>
+                              <div className="space-y-1">
+                                <input
+                                  id="input-change-newpassword"
+                                  type="password"
+                                  required
+                                  placeholder="New Password"
+                                  value={authNewPassword}
+                                  onChange={(e) => setAuthNewPassword(e.target.value)}
+                                  className="w-full bg-gray-50 border border-gray-200 rounded-xl py-2.5 px-3.5 text-xs focus:outline-none focus:border-[#3E2723] transition-all"
+                                />
+                              </div>
+                              <button
+                                id="btn-submit-change-password"
+                                type="submit"
+                                disabled={isProcessingAuth}
+                                className="w-full bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold py-2.5 px-4 rounded-xl text-xs transition-all disabled:opacity-50"
+                              >
+                                {isProcessingAuth ? "Updating Security Key..." : "Update Security Password"}
+                              </button>
+                            </form>
+                          </div>
+                        </div>
+
+                        {/* Right Column: Pricing & Billing */}
+                        <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-6 space-y-6">
+                          <div className="space-y-1">
+                            <h3 className="font-bold text-[#3E2723] flex items-center gap-2">
+                              <CreditCard className="w-5 h-5 text-[#FBC02D]" />
+                              <span>Trial & Subscription Status</span>
+                            </h3>
+                            <p className="text-xs text-gray-500">Track and manage licenses and recurring plans</p>
+                          </div>
+
+                          {/* Trial Progress Tracker */}
+                          <div className="space-y-3 p-4 rounded-2xl border border-gray-150 bg-gray-50">
+                            <div className="flex justify-between items-center">
+                              <span className="text-xs font-semibold text-gray-700">7-Day Free Trial Progress</span>
+                              <span className="font-mono text-xs font-bold text-[#3E2723]">
+                                {trialStatus.expired ? 'Trial Completed' : `${trialStatus.daysLeft} days remaining`}
+                              </span>
+                            </div>
+                            <div className="w-full bg-gray-200 h-2.5 rounded-full overflow-hidden">
+                              <div 
+                                className={`h-full transition-all duration-300 ${trialStatus.expired ? 'bg-rose-500' : 'bg-emerald-500'}`} 
+                                style={{ width: `${trialStatus.expired ? 100 : trialStatus.percentTrialUsed}%` }}
+                              ></div>
+                            </div>
+                            <div className="flex justify-between text-[10px] text-gray-400">
+                              <span>Day 1</span>
+                              <span>Day 7 (Expiry)</span>
+                            </div>
+                          </div>
+
+                          {/* Pricing Plans */}
+                          <div className="space-y-4 pt-2">
+                            <span className="text-[10px] text-gray-400 font-bold uppercase tracking-wider block">License Subscription Plans</span>
+                            
+                            {/* Monthly card */}
+                            <div className="p-4 border border-gray-150 rounded-2xl space-y-3 bg-white hover:border-[#FBC02D] transition-all relative overflow-hidden group">
+                              <div className="flex justify-between items-start">
+                                <div>
+                                  <span className="text-xs font-extrabold text-[#3E2723]">Monthly Plan</span>
+                                  <p className="text-[10px] text-gray-400 mt-0.5">Flexible month-by-month support</p>
+                                </div>
+                                <div className="text-right">
+                                  <span className="text-base font-extrabold text-[#3E2723] block">$29.99</span>
+                                  <span className="text-[9px] text-gray-400 font-mono">per month</span>
+                                </div>
+                              </div>
+                              <button
+                                id="btn-subscribe-monthly"
+                                onClick={() => setBillingPlanToPurchase('monthly')}
+                                className="w-full bg-[#3E2723] hover:bg-[#3E2723]/90 text-[#FBC02D] font-bold py-2 px-4 rounded-xl text-xs transition-all shadow flex items-center justify-center gap-1.5"
+                              >
+                                <CreditCard className="w-3.5 h-3.5" />
+                                <span>Subscribe Monthly ($29.99)</span>
+                              </button>
+                            </div>
+
+                            {/* Yearly card */}
+                            <div className="p-4 border-2 border-[#FBC02D] rounded-2xl space-y-3 bg-[#3E2723]/5 hover:border-[#FBC02D] transition-all relative overflow-hidden group">
+                              <div className="absolute top-0 right-0 bg-[#FBC02D] text-[#3E2723] font-bold text-[8px] font-mono uppercase px-2 py-0.5 rounded-bl">
+                                Save 16%
+                              </div>
+                              <div className="flex justify-between items-start">
+                                <div>
+                                  <span className="text-xs font-extrabold text-[#3E2723]">Yearly Plan</span>
+                                  <p className="text-[10px] text-gray-400 mt-0.5">Full annual enterprise license</p>
+                                </div>
+                                <div className="text-right">
+                                  <span className="text-base font-extrabold text-[#3E2723] block">$299.99</span>
+                                  <span className="text-[9px] text-gray-400 font-mono">per year</span>
+                                </div>
+                              </div>
+                              <button
+                                id="btn-subscribe-yearly"
+                                onClick={() => setBillingPlanToPurchase('yearly')}
+                                className="w-full bg-[#3E2723] hover:bg-[#3E2723]/90 text-[#FBC02D] font-bold py-2 px-4 rounded-xl text-xs transition-all shadow flex items-center justify-center gap-1.5"
+                              >
+                                <CreditCard className="w-3.5 h-3.5" />
+                                <span>Subscribe Yearly ($299.99)</span>
+                              </button>
+                            </div>
+
+                            {/* Mock Receipt Generation */}
+                            <div className="p-4 border border-dashed border-gray-200 rounded-2xl bg-gray-50 space-y-3">
+                              <div className="space-y-1">
+                                <span className="text-xs font-bold text-[#3E2723] flex items-center gap-1.5">
+                                  <FileSpreadsheet className="w-4 h-4 text-amber-500" />
+                                  <span>Subscription Invoice / Receipt</span>
+                                </span>
+                                <p className="text-[10px] text-gray-500">
+                                  Generate and download an official itemized PDF invoice receipt for your current subscription status.
+                                </p>
+                              </div>
+                              <button
+                                id="btn-generate-receipt-pdf"
+                                onClick={generateMockInvoicePDF}
+                                className="w-full bg-[#3E2723] hover:bg-[#3E2723]/90 text-[#FBC02D] font-bold py-2 px-4 rounded-xl text-xs transition-all shadow flex items-center justify-center gap-1.5"
+                              >
+                                <Printer className="w-3.5 h-3.5" />
+                                <span>Download PDF Invoice</span>
+                              </button>
+                            </div>
+
+                          </div>
+                        </div>
+
+                      </div>
+                    </div>
+                  )}
+
                 </motion.div>
               </AnimatePresence>
             )}
+
+            {/* --- PAYWALL OVERLAY IF TRIAL EXPIRED --- */}
+            {trialStatus.expired && activeTab !== 'billing' && (
+              <div className="absolute inset-0 bg-[#3E2723]/80 backdrop-blur-md z-40 flex items-center justify-center p-6">
+                <div className="bg-white rounded-3xl p-8 max-w-md w-full shadow-2xl border-2 border-[#FBC02D] text-center space-y-6">
+                  <div className="mx-auto w-16 h-16 bg-rose-50 rounded-full flex items-center justify-center text-rose-500">
+                    <Lock className="w-8 h-8" />
+                  </div>
+                  <div className="space-y-2">
+                    <h3 className="text-xl font-bold text-[#3E2723]">Your 7-Day Free Trial Has Expired</h3>
+                    <p className="text-xs text-gray-500 leading-relaxed">
+                      Thank you for exploring Unified Inventory Intelligence. Your free access period has completed. Please subscribe to a premium plan to continue using this dashboard.
+                    </p>
+                  </div>
+                  <div className="p-4 bg-amber-50 rounded-2xl border border-amber-100 flex items-center gap-3 text-left">
+                    <span className="w-2.5 h-2.5 rounded-full bg-[#FBC02D] shrink-0"></span>
+                    <span className="text-[11px] text-[#3E2723] font-semibold leading-snug">
+                      All your catalog items, logs, and warehouse states are safely preserved.
+                    </span>
+                  </div>
+                  <button
+                    id="btn-paywall-go-to-billing"
+                    onClick={() => setActiveTab('billing')}
+                    className="w-full bg-[#3E2723] hover:bg-[#3E2723]/90 text-[#FBC02D] font-bold py-3.5 px-6 rounded-xl shadow transition-all duration-200 flex items-center justify-center gap-2"
+                  >
+                    <span>Go to Subscription & Billing</span>
+                    <ArrowRight className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            )}
           </main>
+        </SubscriptionRouteGuard>
 
           {/* 5. EMBEDDED CHATBOT WIDGET (Google AI Studio Assistant) */}
           <aside className="w-96 bg-white border-l border-gray-200 flex flex-col justify-between shrink-0 h-full relative z-10">
@@ -4659,59 +5893,147 @@ export default function App() {
               {/* Modal Body */}
               <div className="p-6 space-y-6">
                 
-                {/* Camera Viewport */}
-                <div className="relative aspect-video rounded-2xl bg-black border border-white/10 overflow-hidden shadow-inner flex flex-col items-center justify-center">
-                  
-                  {cameraState === 'requesting' && (
-                    <div className="flex flex-col items-center gap-2 z-10 p-4 text-center">
-                      <RefreshCw className="w-8 h-8 text-[#FBC02D] animate-spin" />
-                      <p className="text-xs text-gray-300">Initializing optical camera hardware...</p>
-                      <p className="text-[10px] text-gray-500">Please accept camera permissions if prompted</p>
-                    </div>
-                  )}
+                {/* Mode Selector Toggle */}
+                <div className="flex items-center justify-between bg-white/5 p-1 rounded-xl border border-white/10">
+                  <button
+                    id="btn-qr-optical-mode"
+                    type="button"
+                    onClick={() => setManualQRInputMode(false)}
+                    className={`flex-1 py-1.5 px-3 rounded-lg text-xs font-bold transition-all flex items-center justify-center gap-2 ${
+                      !manualQRInputMode 
+                        ? "bg-[#FBC02D] text-[#3E2723] shadow-sm" 
+                        : "text-gray-400 hover:text-white"
+                    }`}
+                  >
+                    <Camera className="w-4 h-4" />
+                    <span>Optical Camera Scanner</span>
+                  </button>
+                  <button
+                    id="btn-qr-manual-mode"
+                    type="button"
+                    onClick={() => setManualQRInputMode(true)}
+                    className={`flex-1 py-1.5 px-3 rounded-lg text-xs font-bold transition-all flex items-center justify-center gap-2 ${
+                      manualQRInputMode 
+                        ? "bg-[#FBC02D] text-[#3E2723] shadow-sm" 
+                        : "text-gray-400 hover:text-white"
+                    }`}
+                  >
+                    <Smartphone className="w-4 h-4" />
+                    <span>Keyboard Manual Entry</span>
+                  </button>
+                </div>
 
-                  {cameraState === 'error' && (
-                    <div className="flex flex-col items-center gap-2 z-10 p-6 text-center max-w-xs">
-                      <AlertTriangle className="w-8 h-8 text-rose-500 animate-pulse" />
-                      <p className="text-xs font-bold text-rose-400">Camera Access Blocked</p>
-                      <p className="text-[10px] text-gray-400 leading-normal">{cameraError}</p>
-                      <p className="text-[10px] bg-white/5 px-2 py-1.5 rounded-lg mt-2 text-[#FBC02D] font-mono">
-                        Running in Simulated Sandbox Mode
+                {manualQRInputMode ? (
+                  <div className="relative aspect-video rounded-2xl bg-[#2D1B16] border-2 border-dashed border-[#FBC02D]/30 overflow-hidden p-6 flex flex-col justify-center items-center space-y-4">
+                    <div className="text-center space-y-1">
+                      <h4 className="text-sm font-bold text-white">Damaged or Unreadable Code?</h4>
+                      <p className="text-[11px] text-gray-400 max-w-sm">
+                        Type the alphanumeric SKU code printed on the physical material tag to pull up details manually.
                       </p>
                     </div>
-                  )}
 
-                  <video 
-                    ref={videoRef}
-                    className={`w-full h-full object-cover ${cameraState === 'active' ? 'block' : 'hidden'}`}
-                    autoPlay 
-                    playsInline 
-                    muted
-                  />
+                    <form 
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        if (manualSKUEntry.trim()) {
+                          handleScanSKU(manualSKUEntry.trim());
+                        }
+                      }}
+                      className="w-full max-w-sm flex gap-2"
+                    >
+                      <input
+                        id="inp-manual-sku-entry"
+                        type="text"
+                        placeholder="e.g. SKU-ECOM-200"
+                        value={manualSKUEntry}
+                        onChange={(e) => setManualSKUEntry(e.target.value)}
+                        className="flex-1 bg-black/40 border border-white/20 rounded-xl px-3 py-2.5 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-[#FBC02D] font-mono uppercase"
+                        autoFocus
+                      />
+                      <button
+                        id="btn-submit-manual-sku"
+                        type="submit"
+                        disabled={!manualSKUEntry.trim()}
+                        className="px-4 py-2 bg-[#FBC02D] hover:bg-[#FBC02D]/90 disabled:opacity-50 text-[#3E2723] font-bold text-xs rounded-xl transition-all shadow flex items-center gap-1.5"
+                      >
+                        <Check className="w-4 h-4" />
+                        <span>Apply</span>
+                      </button>
+                    </form>
 
-                  {/* Scanning HUD Overlay (Shown when scanner is active or error is simulated) */}
-                  <div className="absolute inset-0 pointer-events-none flex flex-col justify-between p-4">
-                    {/* Corner Brackets */}
-                    <div className="flex justify-between">
-                      <div className="w-6 h-6 border-t-4 border-l-4 border-[#FBC02D] rounded-tl-lg"></div>
-                      <div className="w-6 h-6 border-t-4 border-r-4 border-[#FBC02D] rounded-tr-lg"></div>
-                    </div>
-
-                    {/* Animated Scanning Line */}
-                    <div className="w-full h-0.5 bg-[#FBC02D] opacity-75 shadow-[0_0_12px_#FBC02D] animate-bounce"></div>
-
-                    <div className="flex justify-between">
-                      <div className="w-6 h-6 border-b-4 border-l-4 border-[#FBC02D] rounded-bl-lg"></div>
-                      <div className="w-6 h-6 border-b-4 border-r-4 border-[#FBC02D] rounded-br-lg"></div>
+                    <div className="flex gap-2 flex-wrap justify-center max-w-md">
+                      <span className="text-[10px] text-gray-500">Suggestions:</span>
+                      {items.filter(item => 
+                        item.sku.toLowerCase().includes(manualSKUEntry.toLowerCase())
+                      ).slice(0, 3).map(item => (
+                        <button
+                          key={item.id}
+                          type="button"
+                          onClick={() => {
+                            setManualSKUEntry(item.sku);
+                          }}
+                          className="text-[9px] bg-white/5 border border-white/10 px-2 py-0.5 rounded text-gray-300 hover:text-white hover:border-[#FBC02D] transition-all font-mono"
+                        >
+                          {item.sku}
+                        </button>
+                      ))}
                     </div>
                   </div>
+                ) : (
+                  /* Camera Viewport */
+                  <div className="relative aspect-video rounded-2xl bg-black border border-white/10 overflow-hidden shadow-inner flex flex-col items-center justify-center">
+                    
+                    {cameraState === 'requesting' && (
+                      <div className="flex flex-col items-center gap-2 z-10 p-4 text-center">
+                        <RefreshCw className="w-8 h-8 text-[#FBC02D] animate-spin" />
+                        <p className="text-xs text-gray-300">Initializing optical camera hardware...</p>
+                        <p className="text-[10px] text-gray-500">Please accept camera permissions if prompted</p>
+                      </div>
+                    )}
 
-                  {/* Status Overlay bottom label */}
-                  <div className="absolute bottom-3 left-1/2 -translate-x-1/2 bg-black/60 px-3 py-1 rounded-full text-[10px] font-mono text-[#FBC02D] flex items-center gap-1">
-                    <span className="w-1.5 h-1.5 bg-red-500 rounded-full animate-ping"></span>
-                    <span>{cameraState === 'active' ? "LIVE OPTICAL DETECTOR READY" : "SIMULATED DECK STANDBY"}</span>
+                    {cameraState === 'error' && (
+                      <div className="flex flex-col items-center gap-2 z-10 p-6 text-center max-w-xs">
+                        <AlertTriangle className="w-8 h-8 text-rose-500 animate-pulse" />
+                        <p className="text-xs font-bold text-rose-400">Camera Access Blocked</p>
+                        <p className="text-[10px] text-gray-400 leading-normal">{cameraError}</p>
+                        <p className="text-[10px] bg-white/5 px-2 py-1.5 rounded-lg mt-2 text-[#FBC02D] font-mono">
+                          Running in Simulated Sandbox Mode
+                        </p>
+                      </div>
+                    )}
+
+                    <video 
+                      ref={videoRef}
+                      className={`w-full h-full object-cover ${cameraState === 'active' ? 'block' : 'hidden'}`}
+                      autoPlay 
+                      playsInline 
+                      muted
+                    />
+
+                    {/* Scanning HUD Overlay (Shown when scanner is active or error is simulated) */}
+                    <div className="absolute inset-0 pointer-events-none flex flex-col justify-between p-4">
+                      {/* Corner Brackets */}
+                      <div className="flex justify-between">
+                        <div className="w-6 h-6 border-t-4 border-l-4 border-[#FBC02D] rounded-tl-lg"></div>
+                        <div className="w-6 h-6 border-t-4 border-r-4 border-[#FBC02D] rounded-tr-lg"></div>
+                      </div>
+
+                      {/* Animated Scanning Line */}
+                      <div className="w-full h-0.5 bg-[#FBC02D] opacity-75 shadow-[0_0_12px_#FBC02D] animate-bounce"></div>
+
+                      <div className="flex justify-between">
+                        <div className="w-6 h-6 border-b-4 border-l-4 border-[#FBC02D] rounded-bl-lg"></div>
+                        <div className="w-6 h-6 border-b-4 border-r-4 border-[#FBC02D] rounded-br-lg"></div>
+                      </div>
+                    </div>
+
+                    {/* Status Overlay bottom label */}
+                    <div className="absolute bottom-3 left-1/2 -translate-x-1/2 bg-black/60 px-3 py-1 rounded-full text-[10px] font-mono text-[#FBC02D] flex items-center gap-1">
+                      <span className="w-1.5 h-1.5 bg-red-500 rounded-full animate-ping"></span>
+                      <span>{cameraState === 'active' ? "LIVE OPTICAL DETECTOR READY" : "SIMULATED DECK STANDBY"}</span>
+                    </div>
                   </div>
-                </div>
+                )}
 
                 {/* Simulated Barcodes / Desk items (For perfect local testing and visual completeness) */}
                 <div className="space-y-3">
@@ -5026,6 +6348,372 @@ export default function App() {
                   <span>Print Asset Tag</span>
                 </button>
               </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* STOCK VARIANCE AUDIT LOG MODAL */}
+      <AnimatePresence>
+        {varianceItem && (
+          <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4 backdrop-blur-xs">
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              className="bg-white rounded-3xl w-full max-w-md shadow-2xl border border-gray-200 overflow-hidden"
+            >
+              {/* Modal Header */}
+              <div className="p-5 border-b border-gray-100 bg-[#3E2723]/5 flex items-center justify-between">
+                <div className="flex items-center gap-2.5">
+                  <div className="p-2 bg-amber-100 text-amber-900 rounded-xl">
+                    <Clipboard className="w-5 h-5 text-amber-700" />
+                  </div>
+                  <div>
+                    <h3 className="font-bold text-sm text-[#3E2723] tracking-wide">Stock Variance Audit</h3>
+                    <p className="text-[10px] text-gray-500">Log discrepancies between physical stock and system records</p>
+                  </div>
+                </div>
+                <button
+                  id="btn-close-variance-modal"
+                  onClick={() => setVarianceItem(null)}
+                  className="p-1.5 rounded-lg hover:bg-gray-100 text-gray-400 hover:text-gray-600 transition-all"
+                  type="button"
+                >
+                  <X className="w-4.5 h-4.5" />
+                </button>
+              </div>
+
+              {/* Modal Form */}
+              <form onSubmit={handleLogVariance}>
+                <div className="p-6 space-y-4">
+                  {/* Current State Info */}
+                  <div className="bg-gray-50 rounded-2xl p-4 border border-gray-100 space-y-2">
+                    <div className="flex justify-between text-[10px] text-gray-400 font-bold uppercase">
+                      <span>Item Details</span>
+                      <span className="font-mono text-gray-700 font-normal">{varianceItem.sku}</span>
+                    </div>
+                    <div className="text-xs font-semibold text-[#3E2723]">{varianceItem.name}</div>
+                    
+                    <div className="grid grid-cols-2 gap-4 pt-2 border-t border-gray-200/60 text-xs">
+                      <div>
+                        <span className="text-[10px] text-gray-400 block">System Stock:</span>
+                        <strong className="text-[#3E2723]">{varianceItem.stock} {varianceItem.unit}</strong>
+                      </div>
+                      <div>
+                        <span className="text-[10px] text-gray-400 block">Unit Cost:</span>
+                        <strong className="text-[#3E2723]">${varianceItem.cost.toFixed(2)}</strong>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Physical Count Input */}
+                  <div className="space-y-1">
+                    <label className="block text-xs font-bold text-gray-600" htmlFor="inp-variance-physical">
+                      Physical Counted Quantity ({varianceItem.unit})
+                    </label>
+                    <input
+                      id="inp-variance-physical"
+                      type="number"
+                      min="0"
+                      required
+                      placeholder="Enter actual physical stock count"
+                      value={physicalCount}
+                      onChange={(e) => setPhysicalCount(e.target.value)}
+                      className="w-full bg-gray-50 border border-gray-200 rounded-xl p-3 text-xs text-[#3E2723] focus:outline-none focus:border-amber-500"
+                    />
+                  </div>
+
+                  {/* Variance Reason Selection */}
+                  <div className="space-y-1">
+                    <label className="block text-xs font-bold text-gray-600" htmlFor="inp-variance-reason">
+                      Adjustment Audit Reason
+                    </label>
+                    <select
+                      id="inp-variance-reason"
+                      value={varianceReason}
+                      onChange={(e) => setVarianceReason(e.target.value)}
+                      className="w-full bg-gray-50 border border-gray-200 rounded-xl p-3 text-xs text-[#3E2723] focus:outline-none focus:border-amber-500"
+                    >
+                      <option value="Periodic audit count discrepancy">Periodic audit count discrepancy</option>
+                      <option value="Damaged / Broken material item scrap">Damaged / Broken material item scrap</option>
+                      <option value="Theft or shrinkage inventory adjustment">Theft or shrinkage inventory adjustment</option>
+                      <option value="Inbound material manifest error">Inbound material manifest error</option>
+                    </select>
+                  </div>
+
+                  {/* Net Adjustment Calculation Display */}
+                  {physicalCount !== "" && (
+                    <div className="pt-2">
+                      {(() => {
+                        const diff = Number(physicalCount) - varianceItem.stock;
+                        const valueDiff = diff * varianceItem.cost;
+                        if (diff === 0) {
+                          return (
+                            <div className="p-3 bg-emerald-50 border border-emerald-100 rounded-xl text-center text-xs text-emerald-800 font-bold">
+                              No discrepancies detected. Physical count matches ledger.
+                            </div>
+                          );
+                        }
+                        return (
+                          <div className={`p-3.5 border rounded-xl flex items-center justify-between text-xs font-semibold ${
+                            diff < 0 
+                              ? "bg-red-50 border-red-100 text-red-900" 
+                              : "bg-emerald-50 border-emerald-100 text-emerald-950"
+                          }`}>
+                            <div>
+                              <span className="block text-[10px] text-gray-400 font-normal uppercase">Discrepancy</span>
+                              <span>{diff > 0 ? `+${diff}` : diff} units</span>
+                            </div>
+                            <div className="text-right">
+                              <span className="block text-[10px] text-gray-400 font-normal uppercase">Value Adjustment</span>
+                              <span className="font-mono">{diff > 0 ? "+" : ""}${valueDiff.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                            </div>
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  )}
+                </div>
+
+                {/* Modal Footer */}
+                <div className="p-4 bg-gray-50 border-t border-gray-100 flex justify-end gap-3 text-xs">
+                  <button
+                    id="btn-variance-cancel"
+                    onClick={() => setVarianceItem(null)}
+                    className="px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-600 font-semibold rounded-xl transition-all"
+                    type="button"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    id="btn-variance-submit"
+                    type="submit"
+                    disabled={varianceLogging || physicalCount === ""}
+                    className="px-5 py-2 bg-[#3E2723] hover:bg-[#3E2723]/90 text-[#FBC02D] font-bold rounded-xl transition-all shadow flex items-center gap-1.5 disabled:opacity-50"
+                  >
+                    {varianceLogging ? "Logging Entry..." : "Log Variance Entry"}
+                  </button>
+                </div>
+              </form>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* --- BILLING SECURE CHECKOUT MODAL --- */}
+      <AnimatePresence>
+        {billingPlanToPurchase && (
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              className="bg-white rounded-3xl w-full max-w-md shadow-2xl border border-gray-100 overflow-hidden"
+            >
+              <div className="h-16 bg-[#3E2723] text-white px-6 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <CreditCard className="w-5 h-5 text-[#FBC02D]" />
+                  <span className="font-bold text-sm text-[#FBC02D]">Secure Merchant Checkout</span>
+                </div>
+                <button
+                  id="btn-billing-close-modal"
+                  onClick={() => setBillingPlanToPurchase(null)}
+                  className="p-1 rounded-full text-white/80 hover:text-white hover:bg-white/10 transition-colors"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              {/* Secure checkout switcher */}
+              <div className="p-4 bg-gray-50 border-b border-gray-100 flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setCheckoutMethod('stripe')}
+                  className={`flex-1 py-2 rounded-xl text-xs font-bold transition-all ${
+                    checkoutMethod === 'stripe'
+                      ? 'bg-[#3E2723] text-[#FBC02D]'
+                      : 'bg-white border border-gray-200 text-gray-500 hover:text-gray-700'
+                  }`}
+                >
+                  Stripe Checkout
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCheckoutMethod('simulated')}
+                  className={`flex-1 py-2 rounded-xl text-xs font-bold transition-all ${
+                    checkoutMethod === 'simulated'
+                      ? 'bg-[#3E2723] text-[#FBC02D]'
+                      : 'bg-white border border-gray-200 text-gray-500 hover:text-gray-700'
+                  }`}
+                >
+                  Offline Simulation
+                </button>
+              </div>
+
+              {checkoutMethod === 'stripe' ? (
+                <div className="p-6 space-y-6">
+                  <div className="p-4 bg-gray-50 border border-gray-150 rounded-2xl flex justify-between items-center">
+                    <div>
+                      <span className="text-xs font-bold text-[#3E2723] uppercase">Selected License Plan</span>
+                      <p className="text-[11px] text-gray-500 mt-0.5">
+                        {billingPlanToPurchase === 'monthly' ? 'Monthly Professional Subscription' : 'Yearly Enterprise License'}
+                      </p>
+                    </div>
+                    <span className="font-mono font-extrabold text-[#3E2723] text-base">
+                      {billingPlanToPurchase === 'monthly' ? '$29.99' : '$299.99'}
+                    </span>
+                  </div>
+
+                  {stripePublishableKey ? (
+                    <div className="space-y-4">
+                      <div className="p-4 bg-emerald-50 border border-emerald-100 rounded-2xl space-y-2">
+                        <div className="flex items-center gap-2 text-xs font-bold text-emerald-800">
+                          <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                          <span>Stripe Configuration Loaded</span>
+                        </div>
+                        <p className="text-[11px] text-emerald-700 leading-relaxed">
+                          Your Stripe Merchant environment is active. Clicking the button below will securely redirect you to the Stripe-hosted payment gateway for authorization.
+                        </p>
+                        <div className="pt-1.5 border-t border-emerald-100 flex flex-col gap-1 text-[9px] text-emerald-600 font-mono">
+                          <div><span className="font-semibold">Price ID:</span> {billingPlanToPurchase === 'monthly' ? ((import.meta as any).env?.VITE_STRIPE_PRICE_ID_MONTHLY as string) : ((import.meta as any).env?.VITE_STRIPE_PRICE_ID_YEARLY as string)}</div>
+                          <div><span className="font-semibold">Key:</span> {stripePublishableKey.substring(0, 12)}...{stripePublishableKey.substring(stripePublishableKey.length - 8)}</div>
+                        </div>
+                      </div>
+
+                      <div className="pt-4 flex justify-end gap-3 text-xs">
+                        <button
+                          id="btn-stripe-cancel"
+                          type="button"
+                          onClick={() => setBillingPlanToPurchase(null)}
+                          className="px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-600 font-semibold rounded-xl transition-all"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          id="btn-stripe-redirect"
+                          type="button"
+                          onClick={handleStripeCheckout}
+                          disabled={isProcessingPayment}
+                          className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-xl shadow transition-all flex items-center gap-1.5 disabled:opacity-50"
+                        >
+                          {isProcessingPayment ? "Redirecting..." : "Proceed to Stripe Checkout"}
+                          <ArrowRight className="w-4 h-4" />
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="space-y-4">
+                      <div className="p-4 bg-rose-50 border border-rose-100 rounded-2xl space-y-2">
+                        <div className="flex items-center gap-2 text-xs font-bold text-rose-800">
+                          <AlertTriangle className="w-4 h-4 text-rose-600" />
+                          <span>Stripe Environment Keys Missing</span>
+                        </div>
+                        <p className="text-[11px] text-rose-700 leading-relaxed">
+                          The required VITE_STRIPE_PUBLISHABLE_KEY and Price ID variables are not detected in the environment. Please use the **Offline Simulation** tab instead, or configure your keys.
+                        </p>
+                      </div>
+
+                      <div className="pt-4 flex justify-end text-xs">
+                        <button
+                          type="button"
+                          onClick={() => setCheckoutMethod('simulated')}
+                          className="px-5 py-2 bg-[#3E2723] hover:bg-[#3E2723]/90 text-[#FBC02D] font-bold rounded-xl transition-all shadow"
+                        >
+                          Switch to Offline Simulation
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <form id="form-billing-checkout" onSubmit={handleSubscribe} className="p-6 space-y-4">
+                  <div className="p-4 bg-gray-50 border border-gray-150 rounded-2xl flex justify-between items-center">
+                    <div>
+                      <span className="text-xs font-bold text-[#3E2723] uppercase">Selected License Plan</span>
+                      <p className="text-[11px] text-gray-500 mt-0.5">
+                        {billingPlanToPurchase === 'monthly' ? 'Monthly Professional Subscription' : 'Yearly Enterprise License'}
+                      </p>
+                    </div>
+                    <span className="font-mono font-extrabold text-[#3E2723] text-base">
+                      {billingPlanToPurchase === 'monthly' ? '$29.99' : '$299.99'}
+                    </span>
+                  </div>
+
+                  <div className="space-y-3 text-xs">
+                    <div className="space-y-1">
+                      <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400 block">Cardholder Full Name</label>
+                      <input
+                        id="input-card-name"
+                        type="text"
+                        required
+                        placeholder="Sarah Connor"
+                        value={cardName}
+                        onChange={(e) => setCardName(e.target.value)}
+                        className="w-full bg-gray-50 border border-gray-200 rounded-xl py-2.5 px-3.5 text-xs focus:outline-none focus:border-[#3E2723] transition-all"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400 block">Credit Card Number</label>
+                      <input
+                        id="input-card-number"
+                        type="text"
+                        required
+                        placeholder="4000 1234 5678 9010"
+                        value={cardNumber}
+                        onChange={(e) => setCardNumber(e.target.value)}
+                        className="w-full bg-gray-50 border border-gray-200 rounded-xl py-2.5 px-3.5 text-xs focus:outline-none focus:border-[#3E2723] transition-all"
+                      />
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="space-y-1">
+                        <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400 block">Expiration Date</label>
+                        <input
+                          id="input-card-expiry"
+                          type="text"
+                          required
+                          placeholder="MM/YY"
+                          value={cardExpiry}
+                          onChange={(e) => setCardExpiry(e.target.value)}
+                          className="w-full bg-gray-50 border border-gray-200 rounded-xl py-2.5 px-3.5 text-xs focus:outline-none focus:border-[#3E2723] transition-all"
+                        />
+                      </div>
+                      <div className="space-y-1">
+                        <label className="text-[10px] font-bold uppercase tracking-wider text-gray-400 block">CVC Security Code</label>
+                        <input
+                          id="input-card-cvc"
+                          type="text"
+                          required
+                          placeholder="•••"
+                          value={cardCVC}
+                          onChange={(e) => setCardCVC(e.target.value)}
+                          className="w-full bg-gray-50 border border-gray-200 rounded-xl py-2.5 px-3.5 text-xs focus:outline-none focus:border-[#3E2723] transition-all"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="pt-4 border-t border-gray-100 flex justify-end gap-3 text-xs">
+                    <button
+                      id="btn-checkout-cancel"
+                      type="button"
+                      onClick={() => setBillingPlanToPurchase(null)}
+                      className="px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-600 font-semibold rounded-xl transition-all"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      id="btn-checkout-submit"
+                      type="submit"
+                      disabled={isProcessingPayment}
+                      className="px-5 py-2 bg-[#3E2723] hover:bg-[#3E2723]/90 text-[#FBC02D] font-bold rounded-xl transition-all shadow flex items-center gap-1.5 disabled:opacity-50"
+                    >
+                      {isProcessingPayment ? "Validating Card..." : "Authorize Simulated Payment"}
+                    </button>
+                  </div>
+                </form>
+              )}
+
             </motion.div>
           </div>
         )}

@@ -4,6 +4,10 @@ import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
+import { initializeApp, getApps } from "firebase-admin/app";
+import { getFirestore, Firestore } from "firebase-admin/firestore";
+import Stripe from "stripe";
+import cors from "cors";
 import { 
   Item, Location, Movement, Team, User, AuditLog, 
   EcommerceOrder, BOM, WorkOrder, TechnicianVan, PartsRequest, SlackConfig, CustomReport
@@ -12,7 +16,229 @@ import {
 dotenv.config();
 
 const app = express();
+
+// --- STRIPE LAZY INITIALIZATION & WEBHOOK ROUTING ---
+let stripeClient: Stripe | null = null;
+
+function getStripeClient(): Stripe | null {
+  if (!stripeClient) {
+    const key = process.env.STRIPE_SECRET_KEY;
+    if (key) {
+      stripeClient = new Stripe(key, {
+        apiVersion: "2025-01-27.acacia" as any,
+      });
+    }
+  }
+  return stripeClient;
+}
+
+// Stripe Webhook endpoint MUST use express.raw() to preserve request signature.
+// This is registered BEFORE app.use(express.json()) so that we get the raw Buffer.
+app.post(
+  ["/webhook", "/api/stripe/webhook"],
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const sig = req.headers["stripe-signature"];
+    if (!sig) {
+      return res.status(400).send("Webhook Error: Missing stripe-signature header");
+    }
+
+    const stripe = getStripeClient();
+    if (!stripe) {
+      console.warn("[Stripe Webhook] Received event but STRIPE_SECRET_KEY is not configured.");
+      return res.status(400).send("Webhook Error: Server Stripe key is not configured");
+    }
+
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+    if (!webhookSecret) {
+      console.warn("[Stripe Webhook] Received event but STRIPE_WEBHOOK_SECRET is not configured.");
+      return res.status(400).send("Webhook Error: Server Webhook Secret is not configured");
+    }
+
+    let event: Stripe.Event;
+    try {
+      event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+    } catch (err: any) {
+      console.error("[Stripe Webhook] Signature verification failed:", err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    console.log(`[Stripe Webhook] Processed event of type: ${event.type}`);
+
+    // Handle successful payments and lifecycle updates
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object as Stripe.Checkout.Session;
+      
+      // The identifier could be stored in client_reference_id (e.g., email or user id or team id)
+      const identifier = session.client_reference_id || session.customer_email || session.customer_details?.email;
+      
+      if (identifier) {
+        db = readDB();
+        
+        // Let's search for user by email (case-insensitive) or by id
+        let userIndex = db.users.findIndex(
+          (u: any) => u.email.toLowerCase() === identifier.toLowerCase() || u.id === identifier
+        );
+        
+        // If we can't find by client_reference_id directly, let's check customer details email
+        if (userIndex === -1 && session.customer_details?.email) {
+          userIndex = db.users.findIndex(
+            (u: any) => u.email.toLowerCase() === session.customer_details!.email!.toLowerCase()
+          );
+        }
+
+        if (userIndex !== -1) {
+          const user = db.users[userIndex];
+          
+          // Determine plan from priceId or session metadata, or default to monthly
+          let plan: "monthly" | "yearly" = "monthly";
+          
+          const lineItems = session.line_items?.data || [];
+          const priceId = lineItems[0]?.price?.id;
+          
+          const priceIdYearly = process.env.VITE_STRIPE_PRICE_ID_YEARLY;
+          
+          if (priceId && priceId === priceIdYearly) {
+            plan = "yearly";
+          } else if (session.metadata?.plan === "yearly") {
+            plan = "yearly";
+          }
+
+          user.subscriptionStatus = "active";
+          user.subscriptionType = plan;
+          user.subscribedAt = new Date().toISOString();
+
+          logAudit(
+            "User",
+            user.id,
+            "SUBSCRIBE",
+            "Stripe Gateway",
+            `User ${user.name} subscribed to ${plan} plan via Webhook.`
+          );
+          
+          writeDB(db);
+          console.log(`[Stripe Webhook] Subscription successfully activated for user: ${user.email} (${plan})`);
+        } else {
+          // If user not found, let's also support updating teams if client_reference_id was a teamId
+          const teamIndex = db.teams.findIndex((t: any) => t.id === identifier);
+          if (teamIndex !== -1) {
+            const team = db.teams[teamIndex];
+            team.status = "active";
+            team.tier = "premium";
+            logAudit(
+              "Team",
+              team.id,
+              "SUBSCRIBE",
+              "Stripe Gateway",
+              `Team ${team.name} subscription completed via Webhook.`
+            );
+            writeDB(db);
+            console.log(`[Stripe Webhook] Subscription successfully activated for team: ${team.name}`);
+          } else {
+            console.warn(`[Stripe Webhook] No matching User or Team found for reference identifier: ${identifier}`);
+          }
+        }
+      } else {
+        console.warn("[Stripe Webhook] No reference identifier or email found in checkout session object.");
+      }
+    } else if (event.type === "customer.subscription.deleted" || event.type === "customer.subscription.updated") {
+      const subscription = event.data.object as Stripe.Subscription;
+      let userEmail = subscription.metadata?.email || subscription.metadata?.user_email || subscription.metadata?.userId;
+      
+      if (!userEmail && typeof subscription.customer === "string") {
+        try {
+          const customer = await stripe.customers.retrieve(subscription.customer);
+          if (customer && !customer.deleted) {
+            userEmail = (customer as Stripe.Customer).email || undefined;
+          }
+        } catch (e: any) {
+          console.error("[Stripe Webhook] Error fetching customer details:", e.message);
+        }
+      }
+
+      if (userEmail) {
+        db = readDB();
+        const userIndex = db.users.findIndex(
+          (u: any) => u.email.toLowerCase() === userEmail!.toLowerCase() || u.id === userEmail
+        );
+        if (userIndex !== -1) {
+          const user = db.users[userIndex];
+          if (event.type === "customer.subscription.deleted") {
+            user.subscriptionStatus = "expired";
+            logAudit("User", user.id, "UNSUBSCRIBE", "Stripe Gateway", `User ${user.name} subscription ended via Stripe.`);
+          } else if (event.type === "customer.subscription.updated") {
+            const status = subscription.status; // 'active', 'past_due', 'canceled', 'unpaid', etc.
+            if (status === "active") {
+              user.subscriptionStatus = "active";
+            } else if (status === "unpaid" || status === "canceled") {
+              user.subscriptionStatus = "expired";
+            }
+            logAudit("User", user.id, "SUBSCRIPTION_UPDATE", "Stripe Gateway", `User ${user.name} subscription status updated to ${status}.`);
+          }
+          writeDB(db);
+          console.log(`[Stripe Webhook] Subscription status updated for user ${user.email} to: ${user.subscriptionStatus}`);
+        } else {
+          console.warn(`[Stripe Webhook] No matching user found for: ${userEmail}`);
+        }
+      } else {
+        console.warn("[Stripe Webhook] Could not determine user email from subscription update/delete event.");
+      }
+    }
+
+    res.json({ received: true });
+  }
+);
+
+// Standard Middlewares for regular JSON endpoints
+app.use(cors({ origin: true }));
 app.use(express.json());
+
+// Create Checkout Session
+app.post(
+  ["/create-checkout-session", "/api/stripe/create-checkout-session"],
+  async (req, res) => {
+    const { priceId, teamId, successUrl, cancelUrl } = req.body;
+
+    if (!priceId) {
+      return res.status(400).json({ error: "Missing required parameter: priceId" });
+    }
+
+    const stripe = getStripeClient();
+    if (!stripe) {
+      return res.status(500).json({
+        error: "Stripe integration is not configured on this server. Please set STRIPE_SECRET_KEY.",
+      });
+    }
+
+    try {
+      // Find user/team info to prefill customer email if possible
+      let customerEmail: string | undefined = undefined;
+      db = readDB();
+      const user = db.users.find((u: any) => u.id === teamId || u.email.toLowerCase() === String(teamId).toLowerCase());
+      if (user) {
+        customerEmail = user.email;
+      }
+
+      const session = await stripe.checkout.sessions.create({
+        mode: "subscription",
+        payment_method_types: ["card"],
+        line_items: [{ price: priceId, quantity: 1 }],
+        client_reference_id: teamId, // Tethers transaction to the app team/user
+        customer_email: customerEmail,
+        success_url: `${successUrl || `${process.env.APP_URL || "http://localhost:3000"}/?stripe_checkout=success&plan=monthly`}`,
+        cancel_url: cancelUrl || `${process.env.APP_URL || "http://localhost:3000"}/?stripe_checkout=cancel`,
+        metadata: {
+          plan: priceId === process.env.VITE_STRIPE_PRICE_ID_YEARLY ? "yearly" : "monthly",
+        },
+      });
+
+      res.json({ url: session.url, sessionId: session.id });
+    } catch (error: any) {
+      console.error("[Stripe Create Session Error]:", error);
+      res.status(500).json({ error: error.message });
+    }
+  }
+);
 
 const PORT = 3000;
 const DB_FILE = path.join(process.cwd(), "inventory_db.json");
@@ -111,9 +337,128 @@ function readDB() {
   return defaultData;
 }
 
+let firestoreInstance: Firestore | null = null;
+
+function getFirestoreInstance() {
+  if (firestoreInstance) return firestoreInstance;
+  try {
+    const configPath = path.join(process.cwd(), "firebase-applet-config.json");
+    if (fs.existsSync(configPath)) {
+      const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+      if (getApps().length === 0) {
+        initializeApp({
+          projectId: config.projectId,
+        });
+      }
+      if (config.firestoreDatabaseId) {
+        firestoreInstance = getFirestore(config.firestoreDatabaseId);
+      } else {
+        firestoreInstance = getFirestore();
+      }
+      console.log("[Firebase] Admin initialized with project:", config.projectId, "and databaseId:", config.firestoreDatabaseId || "(default)");
+      return firestoreInstance;
+    }
+  } catch (err) {
+    console.error("[Firebase] Failed to initialize Firestore", err);
+  }
+  return null;
+}
+
+async function loadFromFirestore() {
+  const fsDb = getFirestoreInstance();
+  if (!fsDb) return null;
+
+  try {
+    console.log("[Firebase] Loading state from Firestore...");
+    const collections = [
+      "items", "locations", "movements", "teams", "users", "orders", 
+      "boms", "workOrders", "vans", "partsRequests", "reports", "auditLogs"
+    ];
+    const loadedData: any = {};
+
+    // Load slackConfig
+    try {
+      const doc = await fsDb.collection("inventory_metadata").doc("slackConfig").get();
+      loadedData.slackConfig = doc.exists ? doc.data() : defaultData.slackConfig;
+    } catch (e) {
+      loadedData.slackConfig = defaultData.slackConfig;
+    }
+
+    // Load main collections
+    for (const col of collections) {
+      const snapshot = await fsDb.collection(col).get();
+      if (!snapshot.empty) {
+        const list: any[] = [];
+        snapshot.forEach(doc => {
+          list.push({ id: doc.id, ...doc.data() });
+        });
+        loadedData[col] = list;
+      } else {
+        loadedData[col] = (defaultData as any)[col];
+      }
+    }
+
+    if (loadedData.items && loadedData.items.length > 0) {
+      console.log("[Firebase] State successfully loaded from Firestore.");
+      return loadedData;
+    }
+  } catch (err) {
+    console.error("[Firebase] Error loading from Firestore, using local file/memory:", err);
+  }
+  return null;
+}
+
+async function syncToFirestore(data: typeof defaultData) {
+  const fsDb = getFirestoreInstance();
+  if (!fsDb) return;
+
+  try {
+    console.log("[Firebase] Syncing state to Firestore...");
+    const collections = [
+      "items", "locations", "movements", "teams", "users", "orders", 
+      "boms", "workOrders", "vans", "partsRequests", "reports", "auditLogs"
+    ];
+    
+    // Sync slackConfig
+    await fsDb.collection("inventory_metadata").doc("slackConfig").set(data.slackConfig || {});
+
+    // Sync other collections
+    for (const col of collections) {
+      const itemsList = (data as any)[col] || [];
+      const batch = fsDb.batch();
+      
+      const snapshot = await fsDb.collection(col).get();
+      const existingIds = snapshot.docs.map(d => d.id);
+      const currentIds = itemsList.map((item: any) => String(item.id));
+
+      // Delete removed documents
+      for (const id of existingIds) {
+        if (!currentIds.includes(id)) {
+          batch.delete(fsDb.collection(col).doc(id));
+        }
+      }
+
+      // Set or update current documents
+      for (const item of itemsList) {
+        const { id, ...rest } = item;
+        if (id) {
+          batch.set(fsDb.collection(col).doc(String(id)), rest, { merge: true });
+        }
+      }
+
+      await batch.commit();
+    }
+    console.log("[Firebase] Firestore sync completed successfully.");
+  } catch (err) {
+    console.error("[Firebase] Error syncing to Firestore:", err);
+  }
+}
+
 function writeDB(data: typeof defaultData) {
   try {
     fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), "utf-8");
+    // Trigger Firestore background sync
+    syncToFirestore(data);
   } catch (err) {
     console.error("Error writing database file", err);
   }
@@ -124,6 +469,19 @@ let db = readDB();
 if (!fs.existsSync(DB_FILE)) {
   writeDB(db);
 }
+
+// Perform asynchronous startup load/merge with Firestore
+loadFromFirestore().then((firestoreData) => {
+  if (firestoreData) {
+    db = firestoreData;
+    // Write locally to sync local backup cache file
+    fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2), "utf-8");
+    console.log("[Firebase] Local cache database synchronized with cloud Firestore.");
+  } else {
+    console.log("[Firebase] No data found in Firestore or fallback. Seeding current state to Firestore...");
+    syncToFirestore(db);
+  }
+});
 
 // Helper to log changes to the audit log
 function logAudit(entityType: string, entityId: string, action: string, performedBy: string, details: string) {
@@ -297,6 +655,34 @@ app.put("/api/items/:id", (req, res) => {
   writeDB(db);
 
   res.json(updated);
+});
+
+app.post("/api/items/:id/variance", (req, res) => {
+  db = readDB();
+  const { id } = req.params;
+  const { physicalStock, reason, performedBy } = req.body;
+  
+  const itemIndex = db.items.findIndex((i: Item) => i.id === id);
+  if (itemIndex === -1) {
+    return res.status(404).json({ error: "Item not found." });
+  }
+
+  const item = db.items[itemIndex];
+  const originalStock = item.stock;
+  const difference = Number(physicalStock) - originalStock;
+  
+  // Update the item's stock
+  item.stock = Number(physicalStock);
+  
+  // Create audit entry
+  const discrepancyText = difference > 0 ? `+${difference}` : `${difference}`;
+  const details = `Stock Variance Log: Physical stock counted at ${physicalStock} units (System record: ${originalStock} units, variance of ${discrepancyText}). Reason: ${reason || "Not specified"}.`;
+  
+  logAudit("Item", id, "STOCK_VARIANCE", performedBy || "Admin", details);
+  checkSafetyStockAlert(item, item.stock, performedBy || "Admin");
+  
+  writeDB(db);
+  res.json({ success: true, item, discrepancy: difference });
 });
 
 app.delete("/api/items/:id", (req, res) => {
@@ -787,6 +1173,163 @@ app.post("/api/slack/test", (req, res) => {
   
   logAudit("SlackSync", "test_ping", "SLACK_PING", "Admin", `Sent test alert: "${dispatchMsg}" to Slack webhook.`);
   res.json({ success: true, message: "Slack test notification triggered successfully.", dispatchedPayload: { text: dispatchMsg } });
+});
+
+// --- AUTHENTICATION & SUBSCRIPTION ENGINES ---
+app.post("/api/auth/signup", (req, res) => {
+  db = readDB();
+  const { name, email, password } = req.body;
+  if (!name || !email || !password) {
+    return res.status(400).json({ error: "Missing name, email, or password." });
+  }
+
+  if (db.users.find((u: any) => u.email.toLowerCase() === email.toLowerCase())) {
+    return res.status(400).json({ error: `An account with email '${email}' already exists.` });
+  }
+
+  const newUser = {
+    id: `usr_${Date.now()}`,
+    name,
+    email: email.toLowerCase(),
+    password,
+    teamId: "team_1",
+    role: "Admin" as const,
+    trialStartDate: new Date().toISOString(),
+    subscriptionStatus: "trialing",
+    subscriptionType: "none",
+    subscribedAt: ""
+  };
+
+  db.users.push(newUser);
+  logAudit("User", newUser.id, "SIGNUP", newUser.name, `New user signed up: ${name} (${email}) starting 7-day free trial.`);
+  writeDB(db);
+
+  res.status(201).json({
+    id: newUser.id,
+    name: newUser.name,
+    email: newUser.email,
+    role: newUser.role,
+    trialStartDate: newUser.trialStartDate,
+    subscriptionStatus: newUser.subscriptionStatus,
+    subscriptionType: newUser.subscriptionType
+  });
+});
+
+app.post("/api/auth/signin", (req, res) => {
+  db = readDB();
+  const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ error: "Missing email or password." });
+  }
+
+  const user = db.users.find((u: any) => u.email.toLowerCase() === email.toLowerCase());
+  
+  if (!user) {
+    return res.status(401).json({ error: "Invalid email or password." });
+  }
+
+  const expectedPassword = user.password || user.name.split(" ")[0].toLowerCase() + "123";
+  if (password !== expectedPassword) {
+    return res.status(401).json({ error: "Invalid email or password." });
+  }
+
+  if (!user.trialStartDate) {
+    user.trialStartDate = new Date(Date.now() - 3 * 86400000).toISOString();
+  }
+  if (!user.subscriptionStatus) {
+    user.subscriptionStatus = user.email === "phidephefem@gmail.com" ? "active" : "trialing";
+    user.subscriptionType = user.email === "phidephefem@gmail.com" ? "yearly" : "none";
+  }
+
+  writeDB(db);
+
+  res.json({
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    trialStartDate: user.trialStartDate,
+    subscriptionStatus: user.subscriptionStatus,
+    subscriptionType: user.subscriptionType,
+    subscribedAt: user.subscribedAt || ""
+  });
+});
+
+app.post("/api/auth/change-password", (req, res) => {
+  db = readDB();
+  const { email, oldPassword, newPassword } = req.body;
+  if (!email || !oldPassword || !newPassword) {
+    return res.status(400).json({ error: "Missing required fields." });
+  }
+
+  const userIndex = db.users.findIndex((u: any) => u.email.toLowerCase() === email.toLowerCase());
+  if (userIndex === -1) {
+    return res.status(404).json({ error: "User not found." });
+  }
+
+  const user = db.users[userIndex];
+  const expectedPassword = user.password || user.name.split(" ")[0].toLowerCase() + "123";
+  
+  if (oldPassword !== expectedPassword) {
+    return res.status(400).json({ error: "Incorrect old password." });
+  }
+
+  user.password = newPassword;
+  logAudit("User", user.id, "PASSWORD_CHANGE", user.name, `User ${user.name} changed their password.`);
+  writeDB(db);
+
+  res.json({ success: true, message: "Password updated successfully." });
+});
+
+app.post("/api/auth/subscribe", (req, res) => {
+  db = readDB();
+  const { email, plan } = req.body;
+  if (!email || !plan || (plan !== "monthly" && plan !== "yearly")) {
+    return res.status(400).json({ error: "Missing email or invalid subscription plan." });
+  }
+
+  const userIndex = db.users.findIndex((u: any) => u.email.toLowerCase() === email.toLowerCase());
+  if (userIndex === -1) {
+    return res.status(404).json({ error: "User not found." });
+  }
+
+  const user = db.users[userIndex];
+  user.subscriptionStatus = "active";
+  user.subscriptionType = plan;
+  user.subscribedAt = new Date().toISOString();
+
+  logAudit("User", user.id, "SUBSCRIBE", user.name, `User ${user.name} subscribed to ${plan} plan.`);
+  writeDB(db);
+
+  res.json({
+    success: true,
+    subscriptionStatus: user.subscriptionStatus,
+    subscriptionType: user.subscriptionType,
+    subscribedAt: user.subscribedAt
+  });
+});
+
+app.post("/api/auth/expire-trial", (req, res) => {
+  db = readDB();
+  const { email } = req.body;
+  if (!email) {
+    return res.status(400).json({ error: "Missing email." });
+  }
+
+  const userIndex = db.users.findIndex((u: any) => u.email.toLowerCase() === email.toLowerCase());
+  if (userIndex === -1) {
+    return res.status(404).json({ error: "User not found." });
+  }
+
+  const user = db.users[userIndex];
+  user.subscriptionStatus = "expired";
+  logAudit("User", user.id, "TRIAL_EXPIRE", "System", `User ${user.name}'s free trial has expired.`);
+  writeDB(db);
+
+  res.json({
+    success: true,
+    user
+  });
 });
 
 // User Management (Admin & Slack Setup Roles)

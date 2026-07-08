@@ -53,6 +53,11 @@ export interface User {
   email: string;
   teamId: string;
   role: 'Admin' | 'Manager' | 'Staff';
+  password?: string;
+  trialStartDate?: string;
+  subscriptionStatus?: 'active' | 'expired' | 'trialing';
+  subscriptionType?: 'monthly' | 'yearly' | 'none';
+  subscribedAt?: string;
 }
 
 export interface AuditLog {
