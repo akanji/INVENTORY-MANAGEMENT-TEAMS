@@ -141,7 +141,11 @@ app.post(
       } else {
         console.warn("[Stripe Webhook] No reference identifier or email found in checkout session object.");
       }
-    } else if (event.type === "customer.subscription.deleted" || event.type === "customer.subscription.updated") {
+    } else if (
+      event.type === "customer.subscription.created" ||
+      event.type === "customer.subscription.updated" ||
+      event.type === "customer.subscription.deleted"
+    ) {
       const subscription = event.data.object as Stripe.Subscription;
       let userEmail = subscription.metadata?.email || subscription.metadata?.user_email || subscription.metadata?.userId;
       
@@ -163,18 +167,27 @@ app.post(
         );
         if (userIndex !== -1) {
           const user = db.users[userIndex];
-          if (event.type === "customer.subscription.deleted") {
+          const status = subscription.status; // 'active', 'trialing', 'past_due', 'canceled', 'unpaid', etc.
+          
+          if (event.type === "customer.subscription.deleted" || status === "canceled" || status === "unpaid") {
             user.subscriptionStatus = "expired";
             logAudit("User", user.id, "UNSUBSCRIBE", "Stripe Gateway", `User ${user.name} subscription ended via Stripe.`);
-          } else if (event.type === "customer.subscription.updated") {
-            const status = subscription.status; // 'active', 'past_due', 'canceled', 'unpaid', etc.
-            if (status === "active") {
-              user.subscriptionStatus = "active";
-            } else if (status === "unpaid" || status === "canceled") {
-              user.subscriptionStatus = "expired";
-            }
-            logAudit("User", user.id, "SUBSCRIPTION_UPDATE", "Stripe Gateway", `User ${user.name} subscription status updated to ${status}.`);
+          } else if (status === "active") {
+            user.subscriptionStatus = "active";
+            logAudit("User", user.id, "SUBSCRIPTION_UPDATE", "Stripe Gateway", `User ${user.name} subscription status set to active.`);
+          } else if (status === "trialing") {
+            user.subscriptionStatus = "trialing";
+            logAudit("User", user.id, "SUBSCRIPTION_UPDATE", "Stripe Gateway", `User ${user.name} subscription status set to trialing.`);
+          } else {
+            // Treat past_due, incomplete, paused, etc. as expired
+            user.subscriptionStatus = "expired";
+            logAudit("User", user.id, "SUBSCRIPTION_UPDATE", "Stripe Gateway", `User ${user.name} subscription status updated to ${status} (restricted/expired).`);
           }
+          
+          if (subscription.metadata?.plan === "yearly" || subscription.metadata?.plan === "monthly") {
+            user.subscriptionType = subscription.metadata.plan as "monthly" | "yearly";
+          }
+
           writeDB(db);
           console.log(`[Stripe Webhook] Subscription status updated for user ${user.email} to: ${user.subscriptionStatus}`);
         } else {
@@ -183,6 +196,12 @@ app.post(
       } else {
         console.warn("[Stripe Webhook] Could not determine user email from subscription update/delete event.");
       }
+    } else if (event.type === "invoice.paid") {
+      const invoice = event.data.object as Stripe.Invoice;
+      console.log(`[Stripe Webhook] Invoice paid: ${invoice.id}`);
+    } else if (event.type === "invoice.payment_failed") {
+      const invoice = event.data.object as Stripe.Invoice;
+      console.log(`[Stripe Webhook] Invoice payment failed: ${invoice.id}`);
     }
 
     res.json({ received: true });
@@ -229,7 +248,14 @@ app.post(
         cancel_url: cancelUrl || `${process.env.APP_URL || "http://localhost:3000"}/?stripe_checkout=cancel`,
         metadata: {
           plan: priceId === process.env.VITE_STRIPE_PRICE_ID_YEARLY ? "yearly" : "monthly",
+          email: customerEmail || "",
         },
+        subscription_data: {
+          metadata: {
+            plan: priceId === process.env.VITE_STRIPE_PRICE_ID_YEARLY ? "yearly" : "monthly",
+            email: customerEmail || "",
+          }
+        }
       });
 
       res.json({ url: session.url, sessionId: session.id });
